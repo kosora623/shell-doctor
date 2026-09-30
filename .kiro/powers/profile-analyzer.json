@@ -1,0 +1,25 @@
+{
+  "name": "shell-profile-analyzer",
+  "description": "Scans and analyzes shell configuration files and runs shell-doctor diagnostics",
+  "version": "1.0.0",
+  "commands": [
+    {
+      "name": "run-doctor-demo",
+      "description": "Executes shell-doctor startup trace analysis",
+      "command": "cargo run -- demo"
+    },
+    {
+      "name": "verify-properties",
+      "description": "Runs property-based tests to ensure parser stability",
+      "command": "cargo test"
+    }
+  ],
+  "permissions": {
+    "read_files": [
+      "~/.zshrc",
+      "~/.bashrc",
+      "~/.config/fish/config.fish"
+    ],
+    "execute": true
+  }
+}
