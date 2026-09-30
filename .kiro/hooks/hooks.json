@@ -1,0 +1,11 @@
+{
+  "version": "1.0",
+  "hooks": [
+    {
+      "trigger": "on_file_save",
+      "pattern": "src/**/*.rs",
+      "action": "run_command",
+      "command": "cargo test"
+    }
+  ]
+}
