@@ -279,6 +279,12 @@ mod tests {
     // ── プロパティベーステスト（アーキテクチャ規則 §3）──
 
     proptest! {
+        // ────────────────────────────────────────────────────
+        // Property 1-A: split_path_entries — パニックしない
+        // 任意のランダム文字列（特殊記号・連続セパレータ・空文字・極端な長さ）を
+        // 渡してもクラッシュしないことを保証する。
+        // ────────────────────────────────────────────────────
+
         /// 任意のバイト列を含む PATH 文字列でも split がパニックしない
         #[test]
         fn split_never_panics(s in ".*") {
@@ -286,7 +292,86 @@ mod tests {
             let _ = split_path_entries(&s, ';');
         }
 
-        /// split の結果に空文字列や null バイトが含まれない
+        /// 連続するセパレータ・前後空白・極端に長い文字列でも split がパニックしない
+        #[test]
+        fn split_never_panics_edge_cases(
+            // 繰り返しセパレータを含む可能性のある文字列
+            s in "([^:]{0,50}:){0,20}[^:]{0,50}",
+        ) {
+            let _ = split_path_entries(&s, ':');
+        }
+
+        // ────────────────────────────────────────────────────
+        // Property 1-B: analyze_paths — パニックしない
+        // 任意のランダム文字列をエントリとして直接渡しても
+        // クラッシュしないことを保証する。
+        // ────────────────────────────────────────────────────
+
+        /// 任意の文字列をエントリリストとして analyze_paths に渡してもパニックしない
+        #[test]
+        fn analyze_paths_never_panics(
+            entries in prop::collection::vec(".*", 0..20),
+        ) {
+            let _ = analyze_paths(&entries);
+        }
+
+        /// 特殊記号・空白・制御文字を含む文字列を analyze_paths に渡してもパニックしない
+        #[test]
+        fn analyze_paths_never_panics_with_special_chars(
+            entries in prop::collection::vec(
+                // 印字可能 ASCII 全域 + タブ・改行・バックスラッシュ
+                "[\\x20-\\x7e\\t\\n\\\\]{0,60}",
+                0..15,
+            ),
+        ) {
+            let _ = analyze_paths(&entries);
+        }
+
+        // ────────────────────────────────────────────────────
+        // Property 2: Roundtrip 性
+        // 重複のないユニークなエントリを結合して再パースした場合、
+        // 元のエントリ数と完全に一致すること。
+        //
+        // 前提条件:
+        //   - 各エントリはセパレータ (':') も null バイトも前後空白も含まない
+        //     → split 後に増減しない
+        //   - 各エントリは最低 1 文字以上（空エントリは split でスキップされるため）
+        //   - エントリ間で重複なし（大文字・小文字を区別した一意性）
+        // ────────────────────────────────────────────────────
+
+        /// 重複なし有効エントリの結合→再分割後のエントリ数が元と一致する（Roundtrip）
+        #[test]
+        fn split_roundtrip_preserves_count(
+            // セパレータ・null バイト・前後空白を含まない 1〜40 文字のエントリを 0〜15 個生成
+            raw_entries in prop::collection::vec(
+                "[^:;\x00\\s][^:;\x00]{0,38}[^:;\x00\\s]|[^:;\x00\\s]",
+                0..15usize,
+            ),
+        ) {
+            // 大文字小文字を区別して重複排除（normalize_key が lowercase するため
+            // 同一 lowercase のエントリが混ざると分割後に数が合わない可能性がある）
+            let mut seen = std::collections::HashSet::new();
+            let unique: Vec<String> = raw_entries
+                .into_iter()
+                .filter(|e| seen.insert(e.to_lowercase()))
+                .collect();
+
+            let expected = unique.len();
+
+            // ':' で結合して再分割
+            let joined = unique.join(":");
+            let reparsed = split_path_entries(&joined, ':');
+
+            prop_assert_eq!(
+                reparsed.len(),
+                expected,
+                "roundtrip failed: joined={:?}, reparsed={:?}",
+                joined,
+                reparsed,
+            );
+        }
+
+        /// split の結果に空文字列や null バイトが含まれない（不変条件）
         #[test]
         fn split_result_has_no_empty_or_null(s in "[^\x00]{0,200}") {
             for sep in [':', ';'] {
@@ -298,12 +383,33 @@ mod tests {
             }
         }
 
-        /// analyze_paths の total は entries.len() と一致する（fs I/O を避けるため split のみ検証）
+        /// split 後の各エントリは前後に空白を持たない（トリム保証）
         #[test]
-        fn split_total_matches_len(s in "[^;:\x00]{0,100}") {
-            let entries = split_path_entries(&s, ':');
-            // split 後の有効エントリはすべて非空・null バイトなし
-            prop_assert!(entries.iter().all(|e| !e.is_empty() && !e.contains('\0')));
+        fn split_entries_are_trimmed(s in "[^\x00]{0,200}") {
+            for sep in [':', ';'] {
+                let entries = split_path_entries(&s, sep);
+                for e in &entries {
+                    prop_assert_eq!(
+                        e.as_str(),
+                        e.trim(),
+                        "entry is not trimmed: {:?}",
+                        e,
+                    );
+                }
+            }
+        }
+
+        /// analyze_paths の total は常に入力エントリ数と一致する
+        #[test]
+        fn analyze_paths_total_always_equals_input_len(
+            // fs I/O タイムアウトを避けるため存在しない確実なパスを生成
+            entries in prop::collection::vec(
+                "/nonexistent_proptest_[a-z]{1,8}/[a-z]{1,8}",
+                0..10usize,
+            ),
+        ) {
+            let (_, total) = analyze_paths(&entries);
+            prop_assert_eq!(total, entries.len());
         }
     }
 }

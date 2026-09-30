@@ -1,0 +1,48 @@
+--- a/.zshrc
++++ b/.zshrc
+@@ -9,7 +9,37 @@
+ # --- Homebrew ---
+-eval "$(brew shellenv)"
++# [shell-doctor] Line 12: 185ms -> ~0ms
++# Strategy: Static cache of `brew shellenv` output.
++# The cache file is regenerated only when Homebrew itself is updated
++# (detected by comparing the mtime of the brew executable against the cache).
++_brew_cache="${XDG_CACHE_HOME:-$HOME/.cache}/shell-doctor/brew-env.sh"
++_brew_bin="/opt/homebrew/bin/brew"   # adjust if on Intel: /usr/local/bin/brew
++if [[ -x "$_brew_bin" ]]; then
++  # Regenerate cache when brew binary is newer than the cached file
++  if [[ ! -f "$_brew_cache" || "$_brew_bin" -nt "$_brew_cache" ]]; then
++    mkdir -p "${_brew_cache:h}"
++    "$_brew_bin" shellenv >| "$_brew_cache"
++  fi
++  source "$_brew_cache"
++fi
++unset _brew_cache _brew_bin
+ 
+ # --- pyenv ---
+-eval "$(pyenv init -)"
++# [shell-doctor] Line 24: 220ms -> ~0ms
++# Strategy: Lazy-loading wrapper.
++# The real `pyenv init -` is deferred until the first time `pyenv`, `python`,
++# `python3`, or `pip` is actually invoked in this session.
++_pyenv_lazy_init() {
++  # Remove all lazy stubs before initialising the real pyenv,
++  # so recursive calls go directly to the real commands.
++  unfunction pyenv python python3 python2 pip pip3 2>/dev/null
++
++  export PYENV_ROOT="${PYENV_ROOT:-$HOME/.pyenv}"
++  export PATH="$PYENV_ROOT/bin:$PATH"
++
++  if command -v pyenv >/dev/null 2>&1; then
++    eval "$(pyenv init -)"   # runs once, on first use
++  fi
++
++  # Re-dispatch the original command now that pyenv is live
++  "$@"
++}
++# Register stubs for every command that triggers pyenv
++for _cmd in pyenv python python3 python2 pip pip3; do
++  # `functions[$_cmd]` trick: define a forwarding function dynamically
++  eval "function ${_cmd}() { _pyenv_lazy_init ${_cmd} \"\$@\"; }"
++done
++unset _cmd
