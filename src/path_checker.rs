@@ -182,7 +182,10 @@ pub fn compute_health_score(report: &PathHealthReport) -> u32 {
     // 最大ペナルティは全エントリが Dead の場合（= total * 2 ポイント）
     let max_penalty = report.total * 2;
     let penalty = report.dead_paths.len() * 2 + report.duplicates.len();
-    let penalty_pct = (penalty * 100) / max_penalty;
+    // タスク5修正: penalty が max_penalty を超える場合（同一パスが3回以上 = dup が多い）
+    // でも 0 以下にならないよう明示的に min クランプを行う
+    let penalty_clamped = penalty.min(max_penalty);
+    let penalty_pct = (penalty_clamped * 100) / max_penalty;
     100u32.saturating_sub(penalty_pct as u32)
 }
 

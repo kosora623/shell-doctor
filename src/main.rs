@@ -3,7 +3,6 @@ use colored::*;
 use comfy_table::modifiers::UTF8_ROUND_CORNERS;
 use comfy_table::presets::UTF8_FULL;
 use comfy_table::{Attribute, Cell, Color, ContentArrangement, Row, Table};
-use std::path::Path;
 use std::process::Command;
 
 mod parser;
@@ -37,9 +36,14 @@ enum Commands {
         file: Option<String>,
 
         /// headless シェルを起動してトレースを取得するプロファイルファイルのパス
-        /// （例: ~/.zshrc, ~/.bashrc）
+        /// （例: ~/.zshrc, ~/.bashrc, ~/.config/fish/config.fish）
         #[arg(long, short = 's', value_name = "PROFILE")]
         spawn: Option<String>,
+
+        /// 解析対象のシェル種別を明示指定する（zsh/bash/fish/powershell）
+        /// --file 使用時にトレースログのシェル種別が自動判定できない場合に指定する
+        #[arg(long, value_name = "SHELL")]
+        shell: Option<String>,
     },
     /// PATH 環境変数の健全性を診断する（Dead Path・重複エントリの検出）
     PathHealth {
@@ -58,7 +62,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Demo { file, spawn } => run_demo(file, spawn)?,
+        Commands::Demo { file, spawn, shell } => run_demo(file, spawn, shell)?,
         Commands::PathHealth {
             path,
             fail_on_issues,
@@ -70,18 +74,30 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 // ─── Demo コマンド ────────────────────────────────────────────
 
-fn run_demo(file: Option<String>, spawn: Option<String>) -> Result<(), Box<dyn std::error::Error>> {
+fn run_demo(
+    file: Option<String>,
+    spawn: Option<String>,
+    shell: Option<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
     if let Some(profile_path) = spawn {
-        run_demo_spawn(&profile_path)
+        run_demo_spawn(&profile_path, shell.as_deref())
     } else if let Some(trace_path) = file {
-        run_demo_from_file(&trace_path)
+        run_demo_from_file(&trace_path, shell.as_deref())
     } else {
         run_demo_sample()
     }
 }
 
-fn run_demo_spawn(profile_path: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let kind = ProfileKind::from_path(profile_path);
+fn run_demo_spawn(
+    profile_path: &str,
+    shell_override: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // --shell 指定があればそちらを優先、なければパスから推定
+    let kind = match shell_override {
+        Some(s) => ProfileKind::from_shell_name(s),
+        None => ProfileKind::from_path(profile_path),
+    };
+
     println!(
         "{}",
         format!(
@@ -105,39 +121,61 @@ fn run_demo_spawn(profile_path: &str) -> Result<(), Box<dyn std::error::Error>> 
     Ok(())
 }
 
+/// 指定プロファイルを headless シェルで実行し、PS4 タイムスタンプ付きトレースを返す
+///
+/// タスク4修正: パスをシングルクォートでクォートし、パス内のシングルクォートを
+/// `'\''` エスケープすることでスペース・特殊文字による injection を防ぐ。
 fn spawn_shell_trace(
     profile_path: &str,
     kind: &ProfileKind,
 ) -> Result<String, Box<dyn std::error::Error>> {
+    // シェルクォート: シングルクォートで囲み、内部の ' を '\'' に置換
+    let quoted_path = shell_quote(profile_path);
+
     let output = match kind {
-        ProfileKind::Zsh => Command::new("zsh")
-            .args([
-                "-c",
-                &format!(
-                    "PS4='+${{EPOCHREALTIME}} ${{(%):-%x}}:${{LINENO}}: ' zsh --no-rcs -o xtrace -i -c 'source {profile_path}' 2>&1"
-                ),
-            ])
-            .output(),
+        ProfileKind::Zsh | ProfileKind::Other(_) if kind.shell_binary() == "zsh" => {
+            Command::new("zsh")
+                .args([
+                    "-c",
+                    &format!(
+                        "PS4='+${{EPOCHREALTIME}} ${{(%):-%x}}:${{LINENO}}: ' \
+                         zsh --no-rcs -o xtrace -i -c 'source {quoted_path}' 2>&1"
+                    ),
+                ])
+                .output()
+        }
         ProfileKind::Bash => Command::new("bash")
             .args([
                 "-c",
                 &format!(
-                    "PS4='+$(date +%s.%N) ${{BASH_SOURCE}}:${{LINENO}}: ' bash --norc -x -c 'source {profile_path}' 2>&1"
+                    "PS4='+$(date +%s.%N) ${{BASH_SOURCE}}:${{LINENO}}: ' \
+                     bash --norc -x -c 'source {quoted_path}' 2>&1"
                 ),
             ])
             .output(),
+        ProfileKind::Fish => {
+            // Fish: --profile フラグで各関数の実行時間を出力
+            Command::new("fish")
+                .args([
+                    "--profile",
+                    "/dev/stderr",
+                    "--command",
+                    &format!("source {quoted_path}"),
+                ])
+                .output()
+        }
         ProfileKind::PowerShell => Command::new("pwsh")
             .args([
                 "-NoProfile",
                 "-Command",
-                &format!("Set-PSDebug -Trace 2; . '{profile_path}'; Set-PSDebug -Off"),
+                &format!("Set-PSDebug -Trace 2; . {quoted_path}; Set-PSDebug -Off"),
             ])
             .output(),
-        ProfileKind::Other(_) => Command::new("sh")
+        _ => Command::new("sh")
             .args([
                 "-c",
                 &format!(
-                    "PS4='+$(date +%s.%6N) ${{0}}:${{LINENO}}: ' sh -x '{profile_path}' 2>&1"
+                    "PS4='+$(date +%s.%6N) ${{0}}:${{LINENO}}: ' sh -x {quoted_path} 2>&1"
                 ),
             ])
             .output(),
@@ -146,18 +184,31 @@ fn spawn_shell_trace(
     match output {
         Ok(out) => {
             if !out.status.success() && out.stdout.is_empty() && out.stderr.is_empty() {
-                return Err(format!("Shell process exited with status: {}", out.status).into());
+                return Err(
+                    format!("Shell process exited with status: {}", out.status).into()
+                );
             }
             let mut combined = String::from_utf8_lossy(&out.stdout).to_string();
             combined.push_str(&String::from_utf8_lossy(&out.stderr));
             Ok(combined)
         }
-        Err(e) => Err(format!("Failed to spawn shell: {e}").into()),
+        Err(e) => Err(format!("Failed to spawn shell '{}': {e}", kind.shell_binary()).into()),
     }
 }
 
-fn run_demo_from_file(trace_path: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let kind = ProfileKind::from_path(trace_path);
+/// パスをシェルのシングルクォートで安全にクォートする
+///
+/// 例: `/home/my user/.zshrc` → `'/home/my user/.zshrc'`
+///      `/it's/here`           → `'/it'\''s/here'`
+fn shell_quote(path: &str) -> String {
+    format!("'{}'", path.replace('\'', r"'\''"))
+}
+
+/// --file: トレースログファイルを読み込んで解析する
+fn run_demo_from_file(
+    trace_path: &str,
+    shell_override: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error>> {
     println!(
         "{}",
         format!("🩺 Analyzing trace file: {}", trace_path).cyan().bold()
@@ -171,15 +222,36 @@ fn run_demo_from_file(trace_path: &str) -> Result<(), Box<dyn std::error::Error>
         return Ok(());
     }
 
-    let suffix = Path::new(trace_path)
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or(kind.suffix());
+    // バグ1修正: --shell 指定があれば優先。なければパスから推定（ファイル名ベース）。
+    // トレースログのファイル名とプロファイルのファイル名は別物なので、
+    // --shell で明示指定することを推奨し、できない場合は from_path のサフィックスで試みる。
+    let kind = match shell_override {
+        Some(s) => {
+            let k = ProfileKind::from_shell_name(s);
+            println!(
+                "{}",
+                format!("   Shell: {} (--shell override)", k.display_name()).dimmed()
+            );
+            k
+        }
+        None => {
+            let k = ProfileKind::from_path(trace_path);
+            println!(
+                "{}",
+                format!(
+                    "   Tip: use --shell zsh|bash|fish|powershell if auto-detection is wrong"
+                )
+                .dimmed()
+            );
+            k
+        }
+    };
 
-    print_trace_results(&trace_output, suffix, kind.display_name());
+    print_trace_results(&trace_output, kind.suffix(), kind.display_name());
     Ok(())
 }
 
+/// サンプルデータ（引数なし実行時のデモ）
 fn run_demo_sample() -> Result<(), Box<dyn std::error::Error>> {
     println!(
         "{}",
@@ -189,15 +261,22 @@ fn run_demo_sample() -> Result<(), Box<dyn std::error::Error>> {
     );
     println!(
         "{}",
-        "   Tip: shell-doctor demo --file <trace.log>  | Read a captured trace file".dimmed()
+        "   Tip: shell-doctor demo --file <trace.log> [--shell zsh]  | Read a trace file"
+            .dimmed()
     );
     println!(
         "{}",
-        "        shell-doctor demo --spawn ~/.zshrc     | Spawn shell and capture live".dimmed()
+        "        shell-doctor demo --spawn ~/.zshrc                   | Spawn & capture live"
+            .dimmed()
     );
     println!();
 
-    for kind in [ProfileKind::Zsh, ProfileKind::Bash, ProfileKind::PowerShell] {
+    for kind in [
+        ProfileKind::Zsh,
+        ProfileKind::Bash,
+        ProfileKind::Fish,
+        ProfileKind::PowerShell,
+    ] {
         println!(
             "{}",
             format!("── {} Sample ──────────────────────", kind.display_name())
@@ -262,7 +341,6 @@ fn run_path_health_cmd(
     custom_path: Option<&str>,
     fail_on_issues: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // --path 指定の有無をユーザーに明示
     if let Some(p) = custom_path {
         println!(
             "{}",
@@ -382,4 +460,24 @@ fn build_duplicates_table(duplicates: &[path_checker::DuplicateEntry]) -> Table 
         }
     }
     table
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shell_quote_plain_path() {
+        assert_eq!(shell_quote("/usr/bin"), "'/usr/bin'");
+    }
+
+    #[test]
+    fn shell_quote_path_with_spaces() {
+        assert_eq!(shell_quote("/home/my user/.zshrc"), "'/home/my user/.zshrc'");
+    }
+
+    #[test]
+    fn shell_quote_path_with_single_quote() {
+        assert_eq!(shell_quote("/it's/here"), "'/it'\\''s/here'");
+    }
 }
