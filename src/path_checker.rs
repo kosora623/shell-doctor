@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::io;
 use std::path::Path;
 
 // ─── データ構造 ───────────────────────────────────────────────
@@ -10,6 +11,8 @@ pub enum DeadReason {
     NotFound,
     /// 存在するがディレクトリではない（ファイルなど）
     NotADirectory,
+    /// アクセス権限がなく metadata を取得できない
+    PermissionDenied,
 }
 
 /// Dead Path エントリ（REQ-002）
@@ -158,11 +161,16 @@ pub fn run_path_health_on(entries: &[String]) -> PathHealthReport {
                     reason: DeadReason::NotADirectory,
                 });
             }
-            Err(_) => {
+            Err(e) => {
+                let reason = if e.kind() == io::ErrorKind::PermissionDenied {
+                    DeadReason::PermissionDenied
+                } else {
+                    DeadReason::NotFound
+                };
                 dead_paths.push(DeadPathEntry {
                     index,
                     raw: raw.clone(),
-                    reason: DeadReason::NotFound,
+                    reason,
                 });
             }
         }

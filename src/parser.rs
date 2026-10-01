@@ -1,6 +1,113 @@
 use regex::Regex;
 use std::sync::OnceLock;
 
+/// サポートするシェルプロファイルの種別
+#[derive(Debug, Clone, PartialEq)]
+pub enum ProfileKind {
+    Zsh,
+    Bash,
+    PowerShell,
+    /// ファイル拡張子から推定できなかった場合。suffix を直接指定する。
+    Other(String),
+}
+
+impl ProfileKind {
+    /// ファイルパスの末尾から ProfileKind を推定する
+    pub fn from_path(path: &str) -> Self {
+        let lower = path.to_lowercase();
+        if lower.ends_with(".zshrc")
+            || lower.ends_with(".zprofile")
+            || lower.ends_with(".zshenv")
+        {
+            ProfileKind::Zsh
+        } else if lower.ends_with(".bashrc")
+            || lower.ends_with(".bash_profile")
+            || lower.ends_with(".profile")
+        {
+            ProfileKind::Bash
+        } else if lower.ends_with(".ps1")
+            || lower.ends_with("profile.ps1")
+            || lower.ends_with("microsoft.powershell_profile.ps1")
+        {
+            ProfileKind::PowerShell
+        } else {
+            // ファイル名そのもの（例: "init"）をサフィックスとして使う
+            let suffix = std::path::Path::new(path)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or(path)
+                .to_string();
+            ProfileKind::Other(suffix)
+        }
+    }
+
+    /// `analyze_trace` に渡す `target_file_suffix` 文字列を返す
+    pub fn suffix(&self) -> &str {
+        match self {
+            ProfileKind::Zsh => ".zshrc",
+            ProfileKind::Bash => ".bashrc",
+            ProfileKind::PowerShell => "profile.ps1",
+            ProfileKind::Other(s) => s.as_str(),
+        }
+    }
+
+    /// ユーザー向け表示名
+    pub fn display_name(&self) -> &str {
+        match self {
+            ProfileKind::Zsh => "Zsh",
+            ProfileKind::Bash => "Bash",
+            ProfileKind::PowerShell => "PowerShell",
+            ProfileKind::Other(_) => "Shell",
+        }
+    }
+
+    /// 各シェル種別向けのデモ用サンプルトレース文字列を返す
+    pub fn sample_trace(&self) -> &'static str {
+        match self {
+            ProfileKind::Zsh => {
+                r#"
++1727670000.000000 /home/user/.zshrc:1: export PATH=/usr/local/bin:$PATH
++1727670000.005000 /home/user/.zshrc:5: alias g=git
++1727670000.010000 /home/user/.zshrc:12: eval "$(brew shellenv)"
++1727670000.195000 /home/user/.zshrc:24: eval "$(pyenv init -)"
++1727670000.415000 /home/user/.zshrc:40: source ~/.fzf.zsh
++1727670000.440000 /home/user/.zshrc:50: echo 'Ready!'
+"#
+            }
+            ProfileKind::Bash => {
+                r#"
++1727670000.000000 /home/user/.bashrc:1: export PATH=/usr/local/bin:$PATH
++1727670000.003000 /home/user/.bashrc:4: alias ll='ls -la'
++1727670000.008000 /home/user/.bashrc:10: eval "$(direnv hook bash)"
++1727670000.150000 /home/user/.bashrc:18: source ~/.nvm/nvm.sh
++1727670000.380000 /home/user/.bashrc:30: source ~/.rvm/scripts/rvm
++1727670000.400000 /home/user/.bashrc:40: echo 'Ready!'
+"#
+            }
+            ProfileKind::PowerShell => {
+                r#"
++1727670000.000000 C:/Users/user/Documents/PowerShell/profile.ps1:1: $env:PATH += ";C:\tools\bin"
++1727670000.004000 C:/Users/user/Documents/PowerShell/profile.ps1:5: Set-Alias g git
++1727670000.009000 C:/Users/user/Documents/PowerShell/profile.ps1:12: Invoke-Expression (& starship init powershell)
++1727670000.219000 C:/Users/user/Documents/PowerShell/profile.ps1:20: Import-Module posh-git
++1727670000.439000 C:/Users/user/Documents/PowerShell/profile.ps1:35: Import-Module PSReadLine
++1727670000.595000 C:/Users/user/Documents/PowerShell/profile.ps1:45: Write-Host 'Ready!'
+"#
+            }
+            ProfileKind::Other(_) => {
+                r#"
++1727670000.000000 /home/user/.profile:1: export PATH=/usr/local/bin:$PATH
++1727670000.005000 /home/user/.profile:5: alias ls='ls --color=auto'
++1727670000.010000 /home/user/.profile:12: . /etc/bash_completion
++1727670000.120000 /home/user/.profile:20: eval "$(ssh-agent -s)"
++1727670000.300000 /home/user/.profile:30: source ~/bin/custom_funcs.sh
++1727670000.315000 /home/user/.profile:40: echo 'Ready!'
+"#
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct TraceRecord {
     pub timestamp_sec: f64,
@@ -21,7 +128,11 @@ static TRACE_REGEX: OnceLock<Regex> = OnceLock::new();
 
 fn get_trace_regex() -> &'static Regex {
     TRACE_REGEX.get_or_init(|| {
-        Regex::new(r"^\+([0-9]+\.[0-9]+)\s+([^:]+):([0-9]+):\s+(.*)$").unwrap()
+        // ファイルパスのキャプチャグループを `([^:]+(?::[^:]+)?)` に変更することで
+        // Windows のドライブレター（例: C:/path/to/file）を含むパスも正しく解析できる。
+        // 具体的には `C:` の後に `/` が続く場合のみドライブレターとして許容する。
+        Regex::new(r"^\+([0-9]+\.[0-9]+)\s+([a-zA-Z]:[/\\][^:]*|[^:]+):([0-9]+):\s+(.*)$")
+            .unwrap()
     })
 }
 
