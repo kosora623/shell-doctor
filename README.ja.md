@@ -13,6 +13,7 @@ Rust 製の高速シェル診断ツールです。シェルの起動ボトルネ
 - [使い方](#使い方)
   - [demo — 起動ボトルネック解析](#demo--起動ボトルネック解析)
   - [path-health — PATH 診断](#path-health--path-診断)
+- [シェルプロファイルの最適化](#-シェルプロファイルの最適化)
 - [テスト](#テスト)
 
 ---
@@ -20,9 +21,10 @@ Rust 製の高速シェル診断ツールです。シェルの起動ボトルネ
 ## 動作環境
 
 - Rust 1.75 以上
-- `--spawn` で Zsh を使う場合: `zsh` が `$PATH` に存在すること
-- `--spawn` で Bash を使う場合: `bash` が `$PATH` に存在すること
-- `--spawn` で PowerShell を使う場合: `pwsh` が `$PATH` に存在すること
+- `--spawn` / `--shell zsh` を使う場合: `zsh` が `$PATH` に存在すること
+- `--spawn` / `--shell bash` を使う場合: `bash` が `$PATH` に存在すること
+- `--spawn` / `--shell fish` を使う場合: `fish` が `$PATH` に存在すること
+- `--spawn` / `--shell powershell` を使う場合: `pwsh` が `$PATH` に存在すること
 
 ---
 
@@ -55,7 +57,7 @@ Commands:
 
 #### 引数なし — デモデータで動作確認
 
-Zsh・Bash・PowerShell のサンプルトレースをまとめて表示します。セットアップ不要で即試せます。
+Zsh・Bash・Fish・PowerShell のサンプルトレースをまとめて表示します。セットアップ不要で即試せます。
 
 ```bash
 cargo run -- demo
@@ -71,6 +73,9 @@ PS4='+${EPOCHREALTIME} ${(%):-%x}:${LINENO}: ' zsh --no-rcs -o xtrace -i -c 'sou
 
 # 解析:
 cargo run -- demo --file /tmp/zsh_trace.log
+
+# シェル種別が自動判定されない場合は --shell で明示:
+cargo run -- demo --file /tmp/zsh_trace.log --shell zsh
 ```
 
 #### `--spawn` — シェルを直接起動してリアルタイム計測
@@ -84,9 +89,24 @@ cargo run -- demo --spawn ~/.zshrc
 # Bash の場合
 cargo run -- demo --spawn ~/.bashrc
 
+# Fish の場合
+cargo run -- demo --spawn ~/.config/fish/config.fish
+
 # PowerShell の場合
 cargo run -- demo --spawn $PROFILE
+
+# シェル種別を明示指定する場合
+cargo run -- demo --spawn ~/my-init-script --shell zsh
 ```
+
+**`--shell` オプションの値:**
+
+| 値 | シェル |
+|---|---|
+| `zsh` | Zsh |
+| `bash` または `sh` | Bash |
+| `fish` | Fish |
+| `powershell`、`pwsh`、または `ps` | PowerShell |
 
 **出力例:**
 
@@ -110,8 +130,22 @@ cargo run -- demo --spawn $PROFILE
 `PATH` 環境変数を走査し、存在しないパス（Dead Path）と重複登録（Duplicate）を検出します。
 
 ```bash
+# 現在の $PATH を診断
 cargo run -- path-health
+
+# カスタム PATH 文字列を直接渡して診断（CI やテストに便利）
+cargo run -- path-health --path "/usr/bin:/usr/local/bin:/nonexistent"
+
+# 問題が1件でもあれば非ゼロ終了（CI 統合向け）
+cargo run -- path-health --fail-on-issues
 ```
+
+**オプション一覧:**
+
+| オプション | 説明 |
+|---|---|
+| `--path <PATH_STRING>` | `$PATH` の代わりに指定した PATH 文字列を診断する |
+| `--fail-on-issues` | Dead Path または Duplicate が1件でもあれば終了コード 1 で終了する |
 
 **出力例:**
 
@@ -135,7 +169,7 @@ Duplicate Paths
 │ 9 │ /usr/bin │ duplicate │ —     │
 ╰───┴──────────┴───────────┴───────╯
 
-⚡ PATH Health Summary: 12 entries | 2 dead | 1 duplicates | 0 skipped
+⚡ PATH Health Summary: 12 entries | 2 dead | 1 duplicates | Skipped (invalid): 0 entries
 🏥 Health Score: 75/100
 ```
 
@@ -154,6 +188,35 @@ Duplicate Paths
 | 90〜100（緑） | 健全 |
 | 60〜89（黄） | 軽微な問題あり |
 | 0〜59（赤） | 要対処 |
+
+> **スコアの計算:** Dead Path は 2 ポイント、Duplicate は 1 ポイントのペナルティを与えます。
+> 存在しないパスの方が実害が大きいため、より重く扱われます。
+
+---
+
+## 🔧 シェルプロファイルの最適化
+
+`shell-doctor demo` でボトルネックを特定したら、同梱の `zshrc-optimizations.patch` を参考に `.zshrc` を最適化できます。
+
+```bash
+# パッチの内容を確認
+cat zshrc-optimizations.patch
+
+# ドライランで影響範囲を確認
+patch --dry-run ~/.zshrc zshrc-optimizations.patch
+
+# 実際に適用
+patch ~/.zshrc zshrc-optimizations.patch
+```
+
+**パッチの内容:**
+
+| 元の記述 | 最適化手法 | 削減効果の目安 |
+|---|---|---|
+| `eval "$(brew shellenv)"` | 静的キャッシュ（Homebrew 更新時のみ再生成） | 約 185 ms → 約 0 ms |
+| `eval "$(pyenv init -)"` | 遅延ロード（`python`/`pyenv` 初回呼び出し時に初期化） | 約 220 ms → 約 0 ms |
+
+`init`（Zsh 向け）および `login`（Bash 向け）のサンプルスクリプトにも同様のパターンがコメント付きで記載されています。
 
 ---
 

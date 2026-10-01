@@ -15,6 +15,7 @@ Diagnose shell startup bottlenecks and PATH health issues in milliseconds.
 - [Usage](#usage)
   - [demo — Trace Bottleneck Analysis](#demo--trace-bottleneck-analysis)
   - [path-health — PATH Diagnostics](#path-health--path-diagnostics)
+- [Optimizing Your Shell Profile](#-optimizing-your-shell-profile)
 - [Testing](#testing)
 - [Kiro University Challenge](#-kiro-university-challenge-implementation-matrix)
 
@@ -23,9 +24,10 @@ Diagnose shell startup bottlenecks and PATH health issues in milliseconds.
 ## Requirements
 
 - Rust 1.75+
-- For `--spawn` on Zsh: `zsh` must be in `$PATH`
-- For `--spawn` on Bash: `bash` must be in `$PATH`
-- For `--spawn` on PowerShell: `pwsh` must be in `$PATH`
+- For `--spawn` / `--shell zsh`: `zsh` must be in `$PATH`
+- For `--spawn` / `--shell bash`: `bash` must be in `$PATH`
+- For `--spawn` / `--shell fish`: `fish` must be in `$PATH`
+- For `--spawn` / `--shell powershell`: `pwsh` must be in `$PATH`
 
 ---
 
@@ -58,7 +60,7 @@ Identify slow commands in your shell profile by measuring per-line execution tim
 
 #### Run the built-in demo (no setup required)
 
-Displays sample traces for Zsh, Bash, and PowerShell side by side.
+Displays sample traces for Zsh, Bash, Fish, and PowerShell side by side.
 
 ```bash
 cargo run -- demo
@@ -74,6 +76,9 @@ PS4='+${EPOCHREALTIME} ${(%):-%x}:${LINENO}: ' zsh --no-rcs -o xtrace -i -c 'sou
 
 # Then analyze it:
 cargo run -- demo --file /tmp/zsh_trace.log
+
+# If auto-detection picks the wrong shell, use --shell to override:
+cargo run -- demo --file /tmp/zsh_trace.log --shell zsh
 ```
 
 #### Spawn a headless shell and capture live (`--spawn`)
@@ -87,9 +92,24 @@ cargo run -- demo --spawn ~/.zshrc
 # Bash
 cargo run -- demo --spawn ~/.bashrc
 
+# Fish
+cargo run -- demo --spawn ~/.config/fish/config.fish
+
 # PowerShell
 cargo run -- demo --spawn $PROFILE
+
+# Override detected shell kind explicitly
+cargo run -- demo --spawn ~/my-init-script --shell zsh
 ```
+
+**`--shell` option values:**
+
+| Value | Shell |
+|---|---|
+| `zsh` | Zsh |
+| `bash` or `sh` | Bash |
+| `fish` | Fish |
+| `powershell`, `pwsh`, or `ps` | PowerShell |
 
 **Example output:**
 
@@ -113,8 +133,22 @@ cargo run -- demo --spawn $PROFILE
 Scan your `PATH` environment variable for dead entries and duplicates.
 
 ```bash
+# Diagnose current $PATH
 cargo run -- path-health
+
+# Diagnose a custom PATH string (useful for CI or testing)
+cargo run -- path-health --path "/usr/bin:/usr/local/bin:/nonexistent"
+
+# Exit with non-zero code if any issues are found (CI integration)
+cargo run -- path-health --fail-on-issues
 ```
+
+**Options:**
+
+| Option | Description |
+|---|---|
+| `--path <PATH_STRING>` | Diagnose a custom PATH string instead of `$PATH` |
+| `--fail-on-issues` | Exit with code 1 if any dead paths or duplicates are found |
 
 **Example output:**
 
@@ -138,7 +172,7 @@ Duplicate Paths
 │ 9 │ /usr/bin │ duplicate │ —     │
 ╰───┴──────────┴───────────┴───────╯
 
-⚡ PATH Health Summary: 12 entries | 2 dead | 1 duplicates | 0 skipped
+⚡ PATH Health Summary: 12 entries | 2 dead | 1 duplicates | Skipped (invalid): 0 entries
 🏥 Health Score: 75/100
 ```
 
@@ -157,6 +191,37 @@ Duplicate Paths
 | 90–100 (green) | Healthy |
 | 60–89 (yellow) | Minor issues |
 | 0–59 (red) | Needs attention |
+
+> **Scoring:** Dead paths incur a penalty of 2 points each; duplicates incur 1 point each,
+> reflecting that missing paths are more harmful than redundant ones.
+
+---
+
+## 🔧 Optimizing Your Shell Profile
+
+After identifying bottlenecks with `shell-doctor demo`, apply the included patch to your
+`.zshrc` as a starting point for optimization.
+
+```bash
+# Preview the optimizations
+cat zshrc-optimizations.patch
+
+# Apply to your .zshrc (dry-run first)
+patch --dry-run ~/.zshrc zshrc-optimizations.patch
+
+# Apply for real
+patch ~/.zshrc zshrc-optimizations.patch
+```
+
+**What the patch does:**
+
+| Original | Optimization | Typical saving |
+|---|---|---|
+| `eval "$(brew shellenv)"` | Static cache — regenerated only when Homebrew updates | ~185 ms → ~0 ms |
+| `eval "$(pyenv init -)"` | Lazy-loading wrapper — deferred until first `python`/`pyenv` call | ~220 ms → ~0 ms |
+
+The sample profiles in `init` (Zsh) and `login` (Bash) also demonstrate these patterns
+with inline comments.
 
 ---
 
