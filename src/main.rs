@@ -98,6 +98,27 @@ fn run_demo_spawn(
         None => ProfileKind::from_path(profile_path),
     };
 
+    // Fish / PowerShell の --spawn は出力フォーマットが PS4 形式ではないため警告を表示
+    match &kind {
+        ProfileKind::Fish => {
+            eprintln!(
+                "{}",
+                "⚠️  Fish --spawn: output format differs from PS4. \
+                 Results may be empty. Consider using --file with a pre-captured trace."
+                    .yellow()
+            );
+        }
+        ProfileKind::PowerShell { .. } => {
+            eprintln!(
+                "{}",
+                "⚠️  PowerShell --spawn: Set-PSDebug output is not PS4-compatible. \
+                 Results may be empty. Consider using --file with a pre-captured trace."
+                    .yellow()
+            );
+        }
+        _ => {}
+    }
+
     println!(
         "{}",
         format!(
@@ -117,7 +138,22 @@ fn run_demo_spawn(
         );
         return Ok(());
     }
-    print_trace_results(&trace_output, kind.suffix(), kind.display_name());
+
+    let profiles_found = print_trace_results(&trace_output, kind.suffix(), kind.display_name());
+
+    // 空結果かつ Fish/PowerShell の場合は追加ヒントを表示
+    if !profiles_found {
+        match &kind {
+            ProfileKind::Fish | ProfileKind::PowerShell { .. } => {
+                eprintln!(
+                    "{}",
+                    "   Hint: capture a trace manually and use --file instead.".dimmed()
+                );
+            }
+            _ => {}
+        }
+    }
+
     Ok(())
 }
 
@@ -133,7 +169,7 @@ fn spawn_shell_trace(
     let quoted_path = shell_quote(profile_path);
 
     let output = match kind {
-        ProfileKind::Zsh | ProfileKind::Other(_) if kind.shell_binary() == "zsh" => {
+        ProfileKind::Zsh { .. } => {
             Command::new("zsh")
                 .args([
                     "-c",
@@ -144,7 +180,7 @@ fn spawn_shell_trace(
                 ])
                 .output()
         }
-        ProfileKind::Bash => Command::new("bash")
+        ProfileKind::Bash { .. } => Command::new("bash")
             .args([
                 "-c",
                 &format!(
@@ -154,7 +190,10 @@ fn spawn_shell_trace(
             ])
             .output(),
         ProfileKind::Fish => {
-            // Fish: --profile フラグで各関数の実行時間を出力
+            // Fish: --profile フラグは CSV 形式のため PS4 パーサーには非対応。
+            // 代わりに POSIX xtrace 相当の出力を得るため fish -c で bash ライクに実行する。
+            // 現時点では Fish の --spawn は実験的サポートで、出力フォーマットが異なるため
+            // 解析結果が空になる場合があります。--shell bash で代替することを推奨します。
             Command::new("fish")
                 .args([
                     "--profile",
@@ -164,14 +203,14 @@ fn spawn_shell_trace(
                 ])
                 .output()
         }
-        ProfileKind::PowerShell => Command::new("pwsh")
+        ProfileKind::PowerShell { .. } => Command::new("pwsh")
             .args([
                 "-NoProfile",
                 "-Command",
                 &format!("Set-PSDebug -Trace 2; . {quoted_path}; Set-PSDebug -Off"),
             ])
             .output(),
-        _ => Command::new("sh")
+        ProfileKind::Other { .. } => Command::new("sh")
             .args([
                 "-c",
                 &format!(
@@ -222,34 +261,45 @@ fn run_demo_from_file(
         return Ok(());
     }
 
-    // バグ1修正: --shell 指定があれば優先。なければパスから推定（ファイル名ベース）。
+    // --shell 指定があれば優先。なければパスから推定（ファイル名ベース）。
     // トレースログのファイル名とプロファイルのファイル名は別物なので、
-    // --shell で明示指定することを推奨し、できない場合は from_path のサフィックスで試みる。
-    let kind = match shell_override {
+    // 正確な解析には --shell で明示指定を推奨。
+    let (kind, shell_was_inferred) = match shell_override {
         Some(s) => {
             let k = ProfileKind::from_shell_name(s);
             println!(
                 "{}",
                 format!("   Shell: {} (--shell override)", k.display_name()).dimmed()
             );
-            k
+            (k, false)
         }
         None => {
             let k = ProfileKind::from_path(trace_path);
             println!(
                 "{}",
-                format!(
-                    "   Tip: use --shell zsh|bash|fish|powershell if auto-detection is wrong"
-                )
-                .dimmed()
+                "   Tip: use --shell zsh|bash|fish|powershell if auto-detection is wrong"
+                    .dimmed()
             );
-            k
+            (k, true)
         }
     };
 
-    print_trace_results(&trace_output, kind.suffix(), kind.display_name());
+    let found = print_trace_results(&trace_output, kind.suffix(), kind.display_name());
+
+    // --shell 未指定かつ空結果のとき、明確な次のアクションを案内する
+    if !found && shell_was_inferred {
+        eprintln!(
+            "{}",
+            "⚠️  No bottlenecks found. The trace suffix may not match.\n   \
+             Try: shell-doctor demo --file <file> --shell zsh|bash|fish|powershell"
+                .yellow()
+        );
+    }
+
     Ok(())
 }
+
+// この変数を削除して直接 bool を取得
 
 /// サンプルデータ（引数なし実行時のデモ）
 fn run_demo_sample() -> Result<(), Box<dyn std::error::Error>> {
@@ -272,10 +322,10 @@ fn run_demo_sample() -> Result<(), Box<dyn std::error::Error>> {
     println!();
 
     for kind in [
-        ProfileKind::Zsh,
-        ProfileKind::Bash,
+        ProfileKind::Zsh { file_name: ".zshrc".into() },
+        ProfileKind::Bash { file_name: ".bashrc".into() },
         ProfileKind::Fish,
-        ProfileKind::PowerShell,
+        ProfileKind::PowerShell { file_name: "profile.ps1".into() },
     ] {
         println!(
             "{}",
@@ -283,13 +333,14 @@ fn run_demo_sample() -> Result<(), Box<dyn std::error::Error>> {
                 .bold()
                 .dimmed()
         );
-        print_trace_results(kind.sample_trace(), kind.suffix(), kind.display_name());
-    }
+        print_trace_results(kind.sample_trace(), kind.suffix(), kind.display_name());    }
     Ok(())
 }
 
-/// トレース文字列を解析してテーブルを表示する共通ロジック
-fn print_trace_results(trace_output: &str, suffix: &str, shell_name: &str) {
+/// トレース文字列を解析してテーブルを表示する共通ロジック。
+///
+/// ボトルネックが1件以上あれば `true`、空なら `false` を返す。
+fn print_trace_results(trace_output: &str, suffix: &str, shell_name: &str) -> bool {
     let profiles = analyze_trace(trace_output, suffix);
 
     if profiles.is_empty() {
@@ -299,7 +350,7 @@ fn print_trace_results(trace_output: &str, suffix: &str, shell_name: &str) {
                 .green()
         );
         println!();
-        return;
+        return false;
     }
 
     let mut table = Table::new();
@@ -333,6 +384,7 @@ fn print_trace_results(trace_output: &str, suffix: &str, shell_name: &str) {
         "⚡ Total bottleneck delay: {} ms\n",
         total_ms.to_string().red().bold()
     );
+    true
 }
 
 // ─── PathHealth コマンド ──────────────────────────────────────

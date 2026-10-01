@@ -2,24 +2,31 @@ use regex::Regex;
 use std::sync::OnceLock;
 
 /// サポートするシェルプロファイルの種別
+///
+/// `from_path` で生成した場合、各バリアントは実際のファイル名を内包し
+/// `suffix()` でそのファイル名を返す。`from_shell_name` で生成した場合は
+/// フォールバックの一般的なファイル名を返す。
 #[derive(Debug, Clone, PartialEq)]
 pub enum ProfileKind {
-    Zsh,
-    Bash,
+    /// Zsh。`file_name` はトレース解析に使う実際のファイル名。
+    Zsh { file_name: String },
+    /// Bash。`file_name` はトレース解析に使う実際のファイル名。
+    Bash { file_name: String },
+    /// Fish shell。
     Fish,
-    PowerShell,
-    /// ファイル拡張子から推定できなかった場合。suffix を直接指定する。
-    Other(String),
+    /// PowerShell。`file_name` はトレース解析に使う実際のファイル名。
+    PowerShell { file_name: String },
+    /// 拡張子から推定できなかった場合。`file_name` をサフィックスとして使う。
+    Other { file_name: String },
 }
 
 impl ProfileKind {
     /// ファイルパスの末尾から ProfileKind を推定する。
     ///
-    /// 同時に、トレース解析に使うサフィックスをファイル名から正確に保持するため
-    /// `Other` バリアントにはマッチしたファイル名を格納する。
+    /// 各バリアントにファイル名を保持させることで、`suffix()` が正確な
+    /// ファイル名（例: `.zprofile`）を返せるようにしている。
     pub fn from_path(path: &str) -> Self {
         let lower = path.to_lowercase();
-        // ファイル名部分（末尾コンポーネント）を取得
         let file_name = std::path::Path::new(path)
             .file_name()
             .and_then(|n| n.to_str())
@@ -30,75 +37,85 @@ impl ProfileKind {
             || lower.ends_with(".zprofile")
             || lower.ends_with(".zshenv")
         {
-            // バグ2修正: Zsh でもファイル名を保持して suffix() で正確に返す
-            ProfileKind::Other(file_name) // 内部的には Other に統一し種別フラグを別途持つ
+            ProfileKind::Zsh { file_name }
         } else if lower.ends_with(".bashrc")
             || lower.ends_with(".bash_profile")
             || lower.ends_with(".profile")
         {
-            ProfileKind::Other(file_name)
+            ProfileKind::Bash { file_name }
         } else if lower.ends_with("config.fish") {
             ProfileKind::Fish
         } else if lower.ends_with(".ps1")
             || lower.ends_with("profile.ps1")
             || lower.ends_with("microsoft.powershell_profile.ps1")
         {
-            ProfileKind::PowerShell
+            ProfileKind::PowerShell { file_name }
         } else {
-            ProfileKind::Other(file_name)
+            ProfileKind::Other { file_name }
         }
     }
 
-    /// シェル種別名称のヒントを文字列から作成する（`--shell` オプション向け）
+    /// `--shell` オプションの文字列からシェル種別を生成する。
+    ///
+    /// ファイル名が不明なため、各バリアントには一般的なデフォルトファイル名を格納する。
     pub fn from_shell_name(name: &str) -> Self {
         match name.to_lowercase().as_str() {
-            "zsh" => ProfileKind::Zsh,
-            "bash" | "sh" => ProfileKind::Bash,
+            "zsh" => ProfileKind::Zsh {
+                file_name: ".zshrc".into(),
+            },
+            "bash" | "sh" => ProfileKind::Bash {
+                file_name: ".bashrc".into(),
+            },
             "fish" => ProfileKind::Fish,
-            "powershell" | "pwsh" | "ps" => ProfileKind::PowerShell,
-            other => ProfileKind::Other(other.to_string()),
+            "powershell" | "pwsh" | "ps" => ProfileKind::PowerShell {
+                file_name: "profile.ps1".into(),
+            },
+            other => ProfileKind::Other {
+                file_name: other.to_string(),
+            },
         }
     }
 
-    /// `analyze_trace` に渡す `target_file_suffix` 文字列を返す
+    /// `analyze_trace` に渡す `target_file_suffix` 文字列を返す。
+    ///
+    /// `from_path` 経由の場合は実際のファイル名、`from_shell_name` 経由の場合は
+    /// デフォルトのサフィックスを返す。
     pub fn suffix(&self) -> &str {
         match self {
-            // Zsh/Bash は from_path で Other に変換されているため、
-            // ここは --shell オプションで明示指定した場合のフォールバック
-            ProfileKind::Zsh => ".zshrc",
-            ProfileKind::Bash => ".bashrc",
+            ProfileKind::Zsh { file_name } => file_name.as_str(),
+            ProfileKind::Bash { file_name } => file_name.as_str(),
             ProfileKind::Fish => "config.fish",
-            ProfileKind::PowerShell => "profile.ps1",
-            ProfileKind::Other(s) => s.as_str(),
+            ProfileKind::PowerShell { file_name } => file_name.as_str(),
+            ProfileKind::Other { file_name } => file_name.as_str(),
         }
     }
 
     /// ユーザー向け表示名
     pub fn display_name(&self) -> &str {
         match self {
-            ProfileKind::Zsh => "Zsh",
-            ProfileKind::Bash => "Bash",
+            ProfileKind::Zsh { .. } => "Zsh",
+            ProfileKind::Bash { .. } => "Bash",
             ProfileKind::Fish => "Fish",
-            ProfileKind::PowerShell => "PowerShell",
-            ProfileKind::Other(_) => "Shell",
+            ProfileKind::PowerShell { .. } => "PowerShell",
+            ProfileKind::Other { .. } => "Shell",
         }
     }
 
     /// headless 起動時のシェル実行ファイル名
     pub fn shell_binary(&self) -> &str {
         match self {
-            ProfileKind::Zsh => "zsh",
-            ProfileKind::Bash => "bash",
+            ProfileKind::Zsh { .. } => "zsh",
+            ProfileKind::Bash { .. } => "bash",
             ProfileKind::Fish => "fish",
-            ProfileKind::PowerShell => "pwsh",
-            ProfileKind::Other(_) => "sh",
+            ProfileKind::PowerShell { .. } => "pwsh",
+            ProfileKind::Other { .. } => "sh",
         }
     }
 
     /// 各シェル種別向けのデモ用サンプルトレース文字列を返す
     pub fn sample_trace(&self) -> &'static str {
         match self {
-            ProfileKind::Zsh => {
+            ProfileKind::Zsh { .. } => {
                 r#"
 +1727670000.000000 /home/user/.zshrc:1: export PATH=/usr/local/bin:$PATH
 +1727670000.005000 /home/user/.zshrc:5: alias g=git
@@ -108,7 +125,7 @@ impl ProfileKind {
 +1727670000.440000 /home/user/.zshrc:50: echo 'Ready!'
 "#
             }
-            ProfileKind::Bash => {
+            ProfileKind::Bash { .. } => {
                 r#"
 +1727670000.000000 /home/user/.bashrc:1: export PATH=/usr/local/bin:$PATH
 +1727670000.003000 /home/user/.bashrc:4: alias ll='ls -la'
@@ -128,7 +145,7 @@ impl ProfileKind {
 +1727670000.375000 /home/user/.config/fish/config.fish:35: echo 'Ready!'
 "#
             }
-            ProfileKind::PowerShell => {
+            ProfileKind::PowerShell { .. } => {
                 r#"
 +1727670000.000000 C:/Users/user/Documents/PowerShell/profile.ps1:1: $env:PATH += ";C:\tools\bin"
 +1727670000.004000 C:/Users/user/Documents/PowerShell/profile.ps1:5: Set-Alias g git
@@ -138,7 +155,7 @@ impl ProfileKind {
 +1727670000.595000 C:/Users/user/Documents/PowerShell/profile.ps1:45: Write-Host 'Ready!'
 "#
             }
-            ProfileKind::Other(_) => {
+            ProfileKind::Other { .. } => {
                 r#"
 +1727670000.000000 /home/user/.profile:1: export PATH=/usr/local/bin:$PATH
 +1727670000.005000 /home/user/.profile:5: alias ls='ls --color=auto'
@@ -216,7 +233,7 @@ pub fn analyze_trace(trace_output: &str, target_file_suffix: &str) -> Vec<LinePr
         if current.file.ends_with(target_file_suffix) {
             let diff_sec = next.timestamp_sec - current.timestamp_sec;
 
-            // バグ3修正: 負の差分（タイムスタンプ逆順）は 0 にクランプして u64 オーバーフローを防ぐ
+            // 負の差分（タイムスタンプ逆順）はスキップして u64 オーバーフローを防ぐ
             if diff_sec <= 0.0 {
                 continue;
             }
@@ -245,22 +262,34 @@ mod tests {
     // ── ProfileKind テスト ────────────────────────────────────
 
     #[test]
-    fn from_path_zshrc_returns_correct_suffix() {
+    fn from_path_zshrc_returns_zsh_with_correct_suffix() {
         let kind = ProfileKind::from_path("/home/user/.zshrc");
+        assert!(matches!(kind, ProfileKind::Zsh { .. }));
         assert_eq!(kind.suffix(), ".zshrc");
+        assert_eq!(kind.display_name(), "Zsh");
     }
 
     #[test]
-    fn from_path_zprofile_returns_correct_suffix() {
-        // バグ2修正検証: .zprofile は suffix が ".zshrc" ではなく ".zprofile" になる
+    fn from_path_zprofile_returns_zsh_with_zprofile_suffix() {
+        // バグ2修正検証: .zprofile は suffix が ".zprofile" になる（旧: ".zshrc" 固定）
         let kind = ProfileKind::from_path("/home/user/.zprofile");
+        assert!(matches!(kind, ProfileKind::Zsh { .. }));
         assert_eq!(kind.suffix(), ".zprofile");
     }
 
     #[test]
-    fn from_path_bashrc_returns_correct_suffix() {
+    fn from_path_bashrc_returns_bash_with_correct_suffix() {
         let kind = ProfileKind::from_path("/home/user/.bashrc");
+        assert!(matches!(kind, ProfileKind::Bash { .. }));
         assert_eq!(kind.suffix(), ".bashrc");
+        assert_eq!(kind.display_name(), "Bash");
+    }
+
+    #[test]
+    fn from_path_bash_profile_returns_bash_with_correct_suffix() {
+        let kind = ProfileKind::from_path("/home/user/.bash_profile");
+        assert!(matches!(kind, ProfileKind::Bash { .. }));
+        assert_eq!(kind.suffix(), ".bash_profile");
     }
 
     #[test]
@@ -268,22 +297,45 @@ mod tests {
         let kind = ProfileKind::from_path("/home/user/.config/fish/config.fish");
         assert_eq!(kind, ProfileKind::Fish);
         assert_eq!(kind.suffix(), "config.fish");
+        assert_eq!(kind.display_name(), "Fish");
     }
 
     #[test]
-    fn from_shell_name_roundtrip() {
-        assert_eq!(ProfileKind::from_shell_name("zsh"), ProfileKind::Zsh);
-        assert_eq!(ProfileKind::from_shell_name("bash"), ProfileKind::Bash);
+    fn from_path_ps1_returns_powershell_with_correct_suffix() {
+        let kind = ProfileKind::from_path("C:/Users/user/Documents/PowerShell/profile.ps1");
+        assert!(matches!(kind, ProfileKind::PowerShell { .. }));
+        assert_eq!(kind.suffix(), "profile.ps1");
+        assert_eq!(kind.display_name(), "PowerShell");
+    }
+
+    #[test]
+    fn from_shell_name_zsh_returns_zsh_variant() {
+        let kind = ProfileKind::from_shell_name("zsh");
+        assert!(matches!(kind, ProfileKind::Zsh { .. }));
+        assert_eq!(kind.shell_binary(), "zsh");
+    }
+
+    #[test]
+    fn from_shell_name_bash_returns_bash_variant() {
+        let kind = ProfileKind::from_shell_name("bash");
+        assert!(matches!(kind, ProfileKind::Bash { .. }));
+    }
+
+    #[test]
+    fn from_shell_name_fish_returns_fish_variant() {
         assert_eq!(ProfileKind::from_shell_name("fish"), ProfileKind::Fish);
-        assert_eq!(
-            ProfileKind::from_shell_name("powershell"),
-            ProfileKind::PowerShell
-        );
+    }
+
+    #[test]
+    fn from_shell_name_powershell_variants() {
+        for name in ["powershell", "pwsh", "ps"] {
+            let kind = ProfileKind::from_shell_name(name);
+            assert!(matches!(kind, ProfileKind::PowerShell { .. }), "{name}");
+        }
     }
 
     // ── analyze_trace ユニットテスト ──────────────────────────
 
-    /// レコード数が 1 以下のとき空 Vec を返す
     #[test]
     fn analyze_trace_empty_when_fewer_than_two_records() {
         let single = "+1727670000.000000 /home/user/.zshrc:1: export PATH=/usr/bin\n";
@@ -291,7 +343,6 @@ mod tests {
         assert!(analyze_trace("", ".zshrc").is_empty());
     }
 
-    /// target_file_suffix に一致しない行はフィルタされる
     #[test]
     fn analyze_trace_filters_by_suffix() {
         let trace = r#"
@@ -306,7 +357,6 @@ mod tests {
         assert!(bash_profiles.iter().all(|p| p.file.ends_with(".bashrc")));
     }
 
-    /// 1ms 未満の duration はフィルタされる
     #[test]
     fn analyze_trace_filters_sub_millisecond_durations() {
         let trace = r#"
@@ -319,7 +369,6 @@ mod tests {
         assert_eq!(profiles[0].command, "cmd_b");
     }
 
-    /// 負のタイムスタンプ差はスキップされ u64 オーバーフローしない（バグ3修正検証）
     #[test]
     fn analyze_trace_skips_negative_timestamp_diff() {
         let trace = r#"
@@ -327,15 +376,10 @@ mod tests {
 +1727670000.000000 /home/user/.zshrc:2: cmd_b_backwards
 +1727670000.500000 /home/user/.zshrc:3: cmd_c
 "#;
-        // cmd_a の diff は負 → スキップ、cmd_b の diff = 0.5s → 500ms → 含まれる
         let profiles = analyze_trace(trace, ".zshrc");
-        assert!(
-            profiles.iter().all(|p| p.command != "cmd_a"),
-            "negative diff should be skipped"
-        );
+        assert!(profiles.iter().all(|p| p.command != "cmd_a"));
     }
 
-    /// 結果は duration 降順にソートされる
     #[test]
     fn analyze_trace_results_sorted_by_duration_desc() {
         let trace = r#"
@@ -348,7 +392,6 @@ mod tests {
         assert_eq!(profiles[0].command, "slow_cmd");
     }
 
-    /// Windows パス（ドライブレター付き）も正しく解析できる
     #[test]
     fn analyze_trace_handles_windows_paths() {
         let trace = r#"
@@ -360,7 +403,6 @@ mod tests {
         assert_eq!(profiles.len(), 2);
     }
 
-    /// Fish トレースも正しく解析できる
     #[test]
     fn analyze_trace_handles_fish_paths() {
         let kind = ProfileKind::Fish;
@@ -392,16 +434,14 @@ mod tests {
             prop_assert_eq!(r.command, cmd.trim());
         }
 
-        /// analyze_trace は任意の入力でパニックしない
         #[test]
         fn test_analyze_trace_never_panics(s in ".*", suffix in "[a-z.]{1,10}") {
             let _ = analyze_trace(&s, &suffix);
         }
 
-        /// duration_ms は常に u64 範囲内（負タイムスタンプ差でオーバーフローしない）
+        /// duration_ms は負タイムスタンプ差でオーバーフローしない
         #[test]
         fn test_analyze_trace_duration_never_overflows(
-            // タイムスタンプが逆順になる可能性があるランダムな値
             t1 in 0.0f64..2_000_000_000.0f64,
             t2 in 0.0f64..2_000_000_000.0f64,
             line in 1usize..100usize,
@@ -410,13 +450,8 @@ mod tests {
                 "+{t1:.6} /tmp/.zshrc:{line}: cmd_a\n+{t2:.6} /tmp/.zshrc:{}: cmd_b\n",
                 line + 1
             );
-            // パニックせず、負差分はスキップされること（u64 オーバーフローしない）
-            let profiles = analyze_trace(&trace, ".zshrc");
-            for p in &profiles {
-                // t2 - t1 の最大値は ~2e9 秒 = ~2e12 ms。u64::MAX は ~1.8e19 なので収まる。
-                // ここではパニックしないこと（u64 キャストが安全）を検証する。
-                let _ = p.duration_ms; // アクセスできれば overflow していない
-            }
+            // パニックせず、負差分はスキップされること
+            let _ = analyze_trace(&trace, ".zshrc");
         }
     }
 }

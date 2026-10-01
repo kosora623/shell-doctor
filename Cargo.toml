@@ -4,6 +4,8 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+# バージョンはマイナーレベルで固定（パッチは Cargo.lock で管理）
+# バイナリクレートのため Cargo.lock をコミットして完全な再現性を保証している
 clap = { version = "4.5", features = ["derive"] }
 colored = "2.1"
 comfy-table = "7.1"

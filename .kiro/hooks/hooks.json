@@ -1,11 +1,15 @@
 {
-  "version": "1.0",
+  "version": "v1",
   "hooks": [
     {
-      "trigger": "on_file_save",
-      "pattern": "src/**/*.rs",
-      "action": "run_command",
-      "command": "cargo test"
+      "name": "Run Tests on Save",
+      "trigger": "PostFileSave",
+      "description": "Rust ソースファイル保存時に cargo test を自動実行する",
+      "matcher": "src/.*\\\\.rs$",
+      "action": {
+        "type": "command",
+        "command": "cargo test"
+      }
     }
   ]
 }
