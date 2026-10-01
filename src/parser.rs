@@ -194,7 +194,78 @@ mod tests {
     use super::*;
     use proptest::prelude::*;
 
-    // Lesson 4: Property-based testing
+    // ── analyze_trace ユニットテスト ──────────────────────────
+
+    /// レコード数が 1 以下のとき空 Vec を返す
+    #[test]
+    fn analyze_trace_empty_when_fewer_than_two_records() {
+        let single = "+1727670000.000000 /home/user/.zshrc:1: export PATH=/usr/bin\n";
+        assert!(analyze_trace(single, ".zshrc").is_empty());
+        assert!(analyze_trace("", ".zshrc").is_empty());
+    }
+
+    /// target_file_suffix に一致しない行はフィルタされる
+    #[test]
+    fn analyze_trace_filters_by_suffix() {
+        let trace = r#"
++1727670000.000000 /home/user/.zshrc:1: export PATH=/usr/bin
++1727670000.200000 /home/user/.zshrc:2: alias g=git
++1727670000.400000 /home/user/.bashrc:1: export PS1='$ '
++1727670000.600000 /home/user/.bashrc:2: alias ll='ls -la'
+"#;
+        // .zshrc 向けに解析すると bashrc 行は含まれない
+        let zsh_profiles = analyze_trace(trace, ".zshrc");
+        assert!(zsh_profiles.iter().all(|p| p.file.ends_with(".zshrc")));
+
+        // .bashrc 向けに解析すると zshrc 行は含まれない
+        let bash_profiles = analyze_trace(trace, ".bashrc");
+        assert!(bash_profiles.iter().all(|p| p.file.ends_with(".bashrc")));
+    }
+
+    /// 1ms 未満の duration はフィルタされる
+    #[test]
+    fn analyze_trace_filters_sub_millisecond_durations() {
+        // 差分が 0.0005s = 0.5ms → round() で 1ms になる境界ケース
+        let trace = r#"
++1727670000.000000 /home/user/.zshrc:1: cmd_a
++1727670000.000400 /home/user/.zshrc:2: cmd_b
++1727670000.100000 /home/user/.zshrc:3: cmd_c
+"#;
+        // cmd_a の duration = 0.4ms → フィルタされる
+        // cmd_b の duration = 99.6ms → round で 100ms → 含まれる
+        let profiles = analyze_trace(trace, ".zshrc");
+        assert_eq!(profiles.len(), 1);
+        assert_eq!(profiles[0].command, "cmd_b");
+    }
+
+    /// 結果は duration 降順にソートされる
+    #[test]
+    fn analyze_trace_results_sorted_by_duration_desc() {
+        let trace = r#"
++1727670000.000000 /home/user/.zshrc:1: fast_cmd
++1727670000.005000 /home/user/.zshrc:2: slow_cmd
++1727670000.205000 /home/user/.zshrc:3: done
+"#;
+        let profiles = analyze_trace(trace, ".zshrc");
+        // slow_cmd (200ms) が fast_cmd (5ms) より先に来る
+        assert!(profiles[0].duration_ms >= profiles[1].duration_ms);
+        assert_eq!(profiles[0].command, "slow_cmd");
+    }
+
+    /// Windows パス（ドライブレター付き）も正しく解析できる
+    #[test]
+    fn analyze_trace_handles_windows_paths() {
+        let trace = r#"
++1727670000.000000 C:/Users/user/Documents/PowerShell/profile.ps1:1: $env:PATH += ";C:\tools"
++1727670000.210000 C:/Users/user/Documents/PowerShell/profile.ps1:2: Import-Module posh-git
++1727670000.410000 C:/Users/user/Documents/PowerShell/profile.ps1:3: done
+"#;
+        let profiles = analyze_trace(trace, "profile.ps1");
+        assert_eq!(profiles.len(), 2);
+    }
+
+    // ── Property-based testing (Lesson 4) ────────────────────
+
     proptest! {
         #[test]
         fn test_parser_never_panics(s in ".*") {
@@ -214,6 +285,12 @@ mod tests {
             let r = parsed.unwrap();
             prop_assert_eq!(r.line, line);
             prop_assert_eq!(r.command, cmd.trim());
+        }
+
+        /// analyze_trace は任意の入力でパニックしない
+        #[test]
+        fn test_analyze_trace_never_panics(s in ".*", suffix in "[a-z.]{1,10}") {
+            let _ = analyze_trace(&s, &suffix);
         }
     }
 }
