@@ -1,3 +1,4 @@
+use rayon::prelude::*;
 use std::collections::HashMap;
 use std::io;
 use std::path::Path;
@@ -36,7 +37,7 @@ pub struct DuplicateEntry {
 }
 
 /// PATH 診断結果全体（仕様書 §4）
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct PathHealthReport {
     pub total: usize,
     pub skipped_count: usize,
@@ -44,34 +45,14 @@ pub struct PathHealthReport {
     pub duplicates: Vec<DuplicateEntry>,
 }
 
-// ─── 後方互換：PathIssueType / PathIssue（タスク要件の型名）───────
-
-/// タスク要件で指定された問題種別
-#[allow(dead_code)]
-#[derive(Debug, Clone, PartialEq)]
-pub enum PathIssueType {
-    DeadPath,
-    DuplicatePath,
-}
-
-/// タスク要件で指定された汎用 Issue 型
-#[allow(dead_code)]
-#[derive(Debug, Clone)]
-pub struct PathIssue {
-    pub path: String,
-    pub issue_type: PathIssueType,
-    /// Dead Path: 0、Duplicate Path: 出現回数
-    pub occurrences: usize,
-}
-
 // ─── 純粋関数 ─────────────────────────────────────────────────
 
-/// PATH 文字列をセパレータで分割し、トリム済みエントリを返す（REQ-001）
+/// PATH 文字列をセパレータで分割し、トリム済みの有効エントリを返す（REQ-001）
 ///
-/// - 空エントリや null バイトを含むエントリは除去し `skipped_count` に加算（REQ-004）
+/// - 空エントリや null バイトを含むエントリは除去する（REQ-004）
 /// - I/O を一切行わない純粋関数
-#[allow(dead_code)]
-pub fn split_path_entries(raw_path: &str, separator: char) -> Vec<String> {
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn split_path_entries(raw_path: &str, separator: char) -> Vec<String> {
     raw_path
         .split(separator)
         .map(|e| e.trim().to_string())
@@ -79,49 +60,30 @@ pub fn split_path_entries(raw_path: &str, separator: char) -> Vec<String> {
         .collect()
 }
 
-/// 分割済みエントリを検査し、スキップ数・Dead Paths・Duplicates をまとめて返す。
-///
-/// - `entries`: `split_path_entries` から受け取ったトリム済みリスト
-/// - 戻り値: `(Vec<PathIssue>, usize)` = (検出された問題一覧, 総エントリ数)
-///
-/// これはタスク要件の `analyze_paths` シグネチャに準拠した薄いラッパー。
-/// 詳細な診断は `run_path_health` で行う。
-#[allow(dead_code)]
-pub fn analyze_paths(entries: &[String]) -> (Vec<PathIssue>, usize) {
-    let total = entries.len();
-    let report = run_path_health_on(entries);
-
-    let mut issues = Vec::new();
-
-    for dead in &report.dead_paths {
-        issues.push(PathIssue {
-            path: dead.raw.clone(),
-            issue_type: PathIssueType::DeadPath,
-            occurrences: 0,
-        });
-    }
-
-    for dup in &report.duplicates {
-        issues.push(PathIssue {
-            path: dup.canonical.clone(),
-            issue_type: PathIssueType::DuplicatePath,
-            occurrences: dup.occurrences.len(),
-        });
-    }
-
-    (issues, total)
-}
-
 /// OS ネイティブのセパレータで PATH を取得・分割し、完全な診断レポートを返す。
 ///
 /// `std::env::var("PATH")` が `Err` の場合は空エントリとして扱う（REQ-001）。
-pub fn run_path_health() -> PathHealthReport {
+/// `run_path_health_from(None)` の便利ラッパー。
+#[allow(dead_code)]
+pub(crate) fn run_path_health() -> PathHealthReport {
+    run_path_health_from(None)
+}
+
+/// カスタム PATH 文字列を受け取って診断する。
+///
+/// `custom_path` が `Some` のときはその文字列を、`None` のときは環境変数 `PATH` を使う。
+/// CI スクリプトや `--path` オプションからの呼び出し向け。
+pub fn run_path_health_from(custom_path: Option<&str>) -> PathHealthReport {
     #[cfg(target_os = "windows")]
     let separator = ';';
     #[cfg(not(target_os = "windows"))]
     let separator = ':';
 
-    let raw = std::env::var("PATH").unwrap_or_default();
+    let raw = match custom_path {
+        Some(p) => p.to_string(),
+        None => std::env::var("PATH").unwrap_or_default(),
+    };
+
     let all_raw: Vec<String> = raw.split(separator).map(|e| e.trim().to_string()).collect();
 
     // REQ-004: 空エントリ・null バイト含みをスキップ
@@ -142,44 +104,42 @@ pub fn run_path_health() -> PathHealthReport {
 
 /// テスト・再利用向け：エントリスライスを直接受け取って診断レポートを生成する純粋関数。
 ///
-/// - ファイルシステムアクセス（`metadata`、`canonicalize`）のみ副作用として持つが、
-///   入力に対して決定論的であり、環境変数 I/O は行わない。
+/// REQ-002 の補足仕様に従い、`std::fs::metadata` の呼び出しを `rayon` で並列化する。
+/// 出力の順序はオリジナルの PATH 出現順を保持する。
 pub fn run_path_health_on(entries: &[String]) -> PathHealthReport {
     let total = entries.len();
-    let mut dead_paths: Vec<DeadPathEntry> = Vec::new();
 
-    // REQ-002: Dead Path 検出
-    for (index, raw) in entries.iter().enumerate() {
-        match std::fs::metadata(raw) {
-            Ok(meta) if meta.is_dir() => {
-                // 正常なディレクトリ
-            }
-            Ok(_) => {
-                dead_paths.push(DeadPathEntry {
-                    index,
-                    raw: raw.clone(),
-                    reason: DeadReason::NotADirectory,
-                });
-            }
+    // REQ-002: Dead Path 検出（rayon で並列化、出現順を保持するため index 付き）
+    let mut dead_paths: Vec<DeadPathEntry> = entries
+        .par_iter()
+        .enumerate()
+        .filter_map(|(index, raw)| match std::fs::metadata(raw) {
+            Ok(meta) if meta.is_dir() => None, // 正常なディレクトリ
+            Ok(_) => Some(DeadPathEntry {
+                index,
+                raw: raw.clone(),
+                reason: DeadReason::NotADirectory,
+            }),
             Err(e) => {
                 let reason = if e.kind() == io::ErrorKind::PermissionDenied {
                     DeadReason::PermissionDenied
                 } else {
                     DeadReason::NotFound
                 };
-                dead_paths.push(DeadPathEntry {
+                Some(DeadPathEntry {
                     index,
                     raw: raw.clone(),
                     reason,
-                });
+                })
             }
-        }
-    }
+        })
+        .collect();
 
-    // REQ-003: Duplicate 検出
-    // canonical キー → (canonical 文字列, 出現インデックス Vec)
+    // 並列処理後に出現順（index 昇順）へ並び替え
+    dead_paths.sort_by_key(|d| d.index);
+
+    // REQ-003: Duplicate 検出（canonical キー → 出現インデックス Vec）
     let mut seen: HashMap<String, (String, Vec<usize>)> = HashMap::new();
-
     for (index, raw) in entries.iter().enumerate() {
         let key = normalize_key(raw);
         seen.entry(key.clone())
@@ -196,7 +156,7 @@ pub fn run_path_health_on(entries: &[String]) -> PathHealthReport {
         })
         .collect();
 
-    // 出現順でソート（最初の出現インデックス昇順）
+    // 最初の出現インデックス昇順でソート
     duplicates.sort_by_key(|d| d.occurrences[0]);
 
     PathHealthReport {
@@ -205,6 +165,25 @@ pub fn run_path_health_on(entries: &[String]) -> PathHealthReport {
         dead_paths,
         duplicates,
     }
+}
+
+/// Health Score を計算する。
+///
+/// Dead Path と Duplicate の重み付け:
+///   - Dead Path: ペナルティ 2 ポイント（存在しないパスはより深刻）
+///   - Duplicate:  ペナルティ 1 ポイント（冗長だが実害は少ない）
+///
+/// score = 100 - (dead * 2 + dup * 1) * 100 / (total * 2) を上限 100 で clamp。
+/// total が 0 のとき 100 を返す。
+pub fn compute_health_score(report: &PathHealthReport) -> u32 {
+    if report.total == 0 {
+        return 100;
+    }
+    // 最大ペナルティは全エントリが Dead の場合（= total * 2 ポイント）
+    let max_penalty = report.total * 2;
+    let penalty = report.dead_paths.len() * 2 + report.duplicates.len();
+    let penalty_pct = (penalty * 100) / max_penalty;
+    100u32.saturating_sub(penalty_pct as u32)
 }
 
 /// REQ-003: パスの正規化キーを生成する。
@@ -251,18 +230,7 @@ mod tests {
     }
 
     #[test]
-    fn analyze_paths_returns_correct_total() {
-        let entries = vec![
-            "/usr/bin".to_string(),
-            "/nonexistent_path_xyz_9999".to_string(),
-        ];
-        let (_, total) = analyze_paths(&entries);
-        assert_eq!(total, 2);
-    }
-
-    #[test]
     fn duplicate_detection_finds_two_occurrences() {
-        // 同じ存在しないパスを2回登録
         let entries = vec![
             "/fake/path/abc".to_string(),
             "/fake/path/def".to_string(),
@@ -284,92 +252,107 @@ mod tests {
         assert!(report.duplicates.is_empty());
     }
 
+    #[test]
+    fn dead_paths_preserve_original_order() {
+        // 並列処理後も index 昇順で返ることを確認
+        let entries: Vec<String> = (0..10)
+            .map(|i| format!("/nonexistent_rayon_test_{i}"))
+            .collect();
+        let report = run_path_health_on(&entries);
+        let indices: Vec<usize> = report.dead_paths.iter().map(|d| d.index).collect();
+        let mut sorted = indices.clone();
+        sorted.sort();
+        assert_eq!(indices, sorted, "dead_paths should be sorted by index");
+    }
+
+    #[test]
+    fn compute_health_score_perfect_when_empty() {
+        let report = PathHealthReport {
+            total: 0,
+            skipped_count: 0,
+            dead_paths: vec![],
+            duplicates: vec![],
+        };
+        assert_eq!(compute_health_score(&report), 100);
+    }
+
+    #[test]
+    fn compute_health_score_dead_penalizes_more_than_dup() {
+        let base = PathHealthReport {
+            total: 10,
+            skipped_count: 0,
+            dead_paths: vec![],
+            duplicates: vec![],
+        };
+        // dead 1 件
+        let with_dead = PathHealthReport {
+            dead_paths: vec![DeadPathEntry {
+                index: 0,
+                raw: "/x".into(),
+                reason: DeadReason::NotFound,
+            }],
+            ..base.clone()
+        };
+        // dup 1 件
+        let with_dup = PathHealthReport {
+            duplicates: vec![DuplicateEntry {
+                canonical: "/x".into(),
+                occurrences: vec![0, 1],
+            }],
+            ..base
+        };
+        assert!(
+            compute_health_score(&with_dead) < compute_health_score(&with_dup),
+            "dead path should penalize more than duplicate"
+        );
+    }
+
     // ── プロパティベーステスト（アーキテクチャ規則 §3）──
 
     proptest! {
-        // ────────────────────────────────────────────────────
-        // Property 1-A: split_path_entries — パニックしない
-        // 任意のランダム文字列（特殊記号・連続セパレータ・空文字・極端な長さ）を
-        // 渡してもクラッシュしないことを保証する。
-        // ────────────────────────────────────────────────────
-
-        /// 任意のバイト列を含む PATH 文字列でも split がパニックしない
         #[test]
         fn split_never_panics(s in ".*") {
             let _ = split_path_entries(&s, ':');
             let _ = split_path_entries(&s, ';');
         }
 
-        /// 連続するセパレータ・前後空白・極端に長い文字列でも split がパニックしない
         #[test]
-        fn split_never_panics_edge_cases(
-            // 繰り返しセパレータを含む可能性のある文字列
-            s in "([^:]{0,50}:){0,20}[^:]{0,50}",
-        ) {
+        fn split_never_panics_edge_cases(s in "([^:]{0,50}:){0,20}[^:]{0,50}") {
             let _ = split_path_entries(&s, ':');
         }
 
-        // ────────────────────────────────────────────────────
-        // Property 1-B: analyze_paths — パニックしない
-        // 任意のランダム文字列をエントリとして直接渡しても
-        // クラッシュしないことを保証する。
-        // ────────────────────────────────────────────────────
-
-        /// 任意の文字列をエントリリストとして analyze_paths に渡してもパニックしない
         #[test]
-        fn analyze_paths_never_panics(
+        fn run_path_health_on_never_panics(
             entries in prop::collection::vec(".*", 0..20),
         ) {
-            let _ = analyze_paths(&entries);
+            let _ = run_path_health_on(&entries);
         }
 
-        /// 特殊記号・空白・制御文字を含む文字列を analyze_paths に渡してもパニックしない
         #[test]
-        fn analyze_paths_never_panics_with_special_chars(
+        fn run_path_health_on_never_panics_with_special_chars(
             entries in prop::collection::vec(
-                // 印字可能 ASCII 全域 + タブ・改行・バックスラッシュ
                 "[\\x20-\\x7e\\t\\n\\\\]{0,60}",
                 0..15,
             ),
         ) {
-            let _ = analyze_paths(&entries);
+            let _ = run_path_health_on(&entries);
         }
 
-        // ────────────────────────────────────────────────────
-        // Property 2: Roundtrip 性
-        // 重複のないユニークなエントリを結合して再パースした場合、
-        // 元のエントリ数と完全に一致すること。
-        //
-        // 前提条件:
-        //   - 各エントリはセパレータ (':') も null バイトも前後空白も含まない
-        //     → split 後に増減しない
-        //   - 各エントリは最低 1 文字以上（空エントリは split でスキップされるため）
-        //   - エントリ間で重複なし（大文字・小文字を区別した一意性）
-        // ────────────────────────────────────────────────────
-
-        /// 重複なし有効エントリの結合→再分割後のエントリ数が元と一致する（Roundtrip）
         #[test]
         fn split_roundtrip_preserves_count(
-            // セパレータ・null バイト・前後空白を含まない 1〜40 文字のエントリを 0〜15 個生成
             raw_entries in prop::collection::vec(
                 "[^:;\x00\\s][^:;\x00]{0,38}[^:;\x00\\s]|[^:;\x00\\s]",
                 0..15usize,
             ),
         ) {
-            // 大文字小文字を区別して重複排除（normalize_key が lowercase するため
-            // 同一 lowercase のエントリが混ざると分割後に数が合わない可能性がある）
             let mut seen = std::collections::HashSet::new();
             let unique: Vec<String> = raw_entries
                 .into_iter()
                 .filter(|e| seen.insert(e.to_lowercase()))
                 .collect();
-
             let expected = unique.len();
-
-            // ':' で結合して再分割
             let joined = unique.join(":");
             let reparsed = split_path_entries(&joined, ':');
-
             prop_assert_eq!(
                 reparsed.len(),
                 expected,
@@ -379,7 +362,6 @@ mod tests {
             );
         }
 
-        /// split の結果に空文字列や null バイトが含まれない（不変条件）
         #[test]
         fn split_result_has_no_empty_or_null(s in "[^\x00]{0,200}") {
             for sep in [':', ';'] {
@@ -391,33 +373,26 @@ mod tests {
             }
         }
 
-        /// split 後の各エントリは前後に空白を持たない（トリム保証）
         #[test]
         fn split_entries_are_trimmed(s in "[^\x00]{0,200}") {
             for sep in [':', ';'] {
                 let entries = split_path_entries(&s, sep);
                 for e in &entries {
-                    prop_assert_eq!(
-                        e.as_str(),
-                        e.trim(),
-                        "entry is not trimmed: {:?}",
-                        e,
-                    );
+                    prop_assert_eq!(e.as_str(), e.trim(), "entry is not trimmed: {:?}", e);
                 }
             }
         }
 
-        /// analyze_paths の total は常に入力エントリ数と一致する
         #[test]
-        fn analyze_paths_total_always_equals_input_len(
-            // fs I/O タイムアウトを避けるため存在しない確実なパスを生成
+        fn health_score_always_in_range(
             entries in prop::collection::vec(
                 "/nonexistent_proptest_[a-z]{1,8}/[a-z]{1,8}",
                 0..10usize,
             ),
         ) {
-            let (_, total) = analyze_paths(&entries);
-            prop_assert_eq!(total, entries.len());
+            let report = run_path_health_on(&entries);
+            let score = compute_health_score(&report);
+            prop_assert!(score <= 100, "score out of range: {}", score);
         }
     }
 }
