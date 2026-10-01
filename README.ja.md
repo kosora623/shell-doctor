@@ -1,97 +1,94 @@
 # 🩺 shell-doctor
 
-Lightning-fast shell runtime doctor written in Rust, built with Kiro.
+Rust 製の高速シェル診断ツールです。シェルの起動ボトルネックと PATH の問題をミリ秒単位で検出します。
 
-Diagnose shell startup bottlenecks and PATH health issues in milliseconds.
-
-> 🇯🇵 [日本語版ドキュメントはこちら](README.ja.md)
+> 🇺🇸 [English documentation](README.md)
 
 ---
 
-## 📋 Table of Contents
+## 📋 目次
 
-- [Requirements](#requirements)
-- [Installation](#installation)
-- [Usage](#usage)
-  - [demo — Trace Bottleneck Analysis](#demo--trace-bottleneck-analysis)
-  - [path-health — PATH Diagnostics](#path-health--path-diagnostics)
-- [Testing](#testing)
-- [Kiro University Challenge](#-kiro-university-challenge-implementation-matrix)
-
----
-
-## Requirements
-
-- Rust 1.75+
-- For `--spawn` on Zsh: `zsh` must be in `$PATH`
-- For `--spawn` on Bash: `bash` must be in `$PATH`
-- For `--spawn` on PowerShell: `pwsh` must be in `$PATH`
+- [動作環境](#動作環境)
+- [インストール](#インストール)
+- [使い方](#使い方)
+  - [demo — 起動ボトルネック解析](#demo--起動ボトルネック解析)
+  - [path-health — PATH 診断](#path-health--path-診断)
+- [テスト](#テスト)
 
 ---
 
-## Installation
+## 動作環境
+
+- Rust 1.75 以上
+- `--spawn` で Zsh を使う場合: `zsh` が `$PATH` に存在すること
+- `--spawn` で Bash を使う場合: `bash` が `$PATH` に存在すること
+- `--spawn` で PowerShell を使う場合: `pwsh` が `$PATH` に存在すること
+
+---
+
+## インストール
 
 ```bash
 git clone https://github.com/your-name/shell-doctor
 cd shell-doctor
 cargo build --release
-# Optionally add to PATH:
+# 任意でパスに追加:
 # cp target/release/shell-doctor ~/.local/bin/
 ```
 
 ---
 
-## Usage
+## 使い方
 
 ```
 shell-doctor <COMMAND>
 
 Commands:
-  demo         Diagnose shell startup bottlenecks
-  path-health  Diagnose PATH environment variable health
-  help         Print help
+  demo         シェルの起動ボトルネックを診断する
+  path-health  PATH 環境変数の健全性を診断する
+  help         ヘルプを表示する
 ```
 
-### `demo` — Trace Bottleneck Analysis
+### `demo` — 起動ボトルネック解析
 
-Identify slow commands in your shell profile by measuring per-line execution time.
+シェルプロファイルの各行ごとの実行時間を計測し、遅いコマンドを特定します。
 
-#### Run the built-in demo (no setup required)
+#### 引数なし — デモデータで動作確認
 
-Displays sample traces for Zsh, Bash, and PowerShell side by side.
+Zsh・Bash・PowerShell のサンプルトレースをまとめて表示します。セットアップ不要で即試せます。
 
 ```bash
 cargo run -- demo
 ```
 
-#### Analyze a captured trace file (`--file`)
+#### `--file` — トレースファイルを指定して解析
 
-Pass a pre-captured `set -x` trace log directly.
+事前に取得した `set -x` のトレースログファイルを直接渡して解析します。
 
 ```bash
-# Capture a zsh trace first:
+# zsh のトレースをファイルに保存:
 PS4='+${EPOCHREALTIME} ${(%):-%x}:${LINENO}: ' zsh --no-rcs -o xtrace -i -c 'source ~/.zshrc' 2> /tmp/zsh_trace.log
 
-# Then analyze it:
+# 解析:
 cargo run -- demo --file /tmp/zsh_trace.log
 ```
 
-#### Spawn a headless shell and capture live (`--spawn`)
+#### `--spawn` — シェルを直接起動してリアルタイム計測
 
-Let shell-doctor launch the shell, capture the trace, and report — all in one step.
+shell-doctor がシェルを headless で起動し、トレース取得から解析まで一括実行します。
 
 ```bash
-# Zsh
+# Zsh の場合
 cargo run -- demo --spawn ~/.zshrc
 
-# Bash
+# Bash の場合
 cargo run -- demo --spawn ~/.bashrc
 
-# PowerShell
+# PowerShell の場合
 cargo run -- demo --spawn $PROFILE
 ```
 
-**Example output:**
+**出力例:**
 
 ```
 🩺 Spawning Zsh to capture real startup trace: /home/user/.zshrc
@@ -108,15 +105,15 @@ cargo run -- demo --spawn $PROFILE
 
 ---
 
-### `path-health` — PATH Diagnostics
+### `path-health` — PATH 診断
 
-Scan your `PATH` environment variable for dead entries and duplicates.
+`PATH` 環境変数を走査し、存在しないパス（Dead Path）と重複登録（Duplicate）を検出します。
 
 ```bash
 cargo run -- path-health
 ```
 
-**Example output:**
+**出力例:**
 
 ```
 🩺 Diagnosing PATH environment variable...
@@ -142,41 +139,27 @@ Duplicate Paths
 🏥 Health Score: 75/100
 ```
 
-**Dead Path reasons:**
+**Dead Path の判定基準:**
 
-| Reason | Description |
+| 表示 | 意味 |
 |---|---|
-| `Not Found` | Path does not exist on the filesystem |
-| `Not a Directory` | Path exists but is a file, not a directory |
-| `Permission Denied` | Path exists but cannot be accessed due to permissions |
+| `Not Found` | ファイルシステム上に存在しないパス |
+| `Not a Directory` | 存在するがディレクトリではなくファイルなど |
+| `Permission Denied` | 存在するがアクセス権限がないパス |
 
-**Health Score:**
+**Health Score の見方:**
 
-| Score | Status |
+| スコア | 状態 |
 |---|---|
-| 90–100 (green) | Healthy |
-| 60–89 (yellow) | Minor issues |
-| 0–59 (red) | Needs attention |
+| 90〜100（緑） | 健全 |
+| 60〜89（黄） | 軽微な問題あり |
+| 0〜59（赤） | 要対処 |
 
 ---
 
-## Testing
+## テスト
 
 ```bash
-# Unit tests + property-based tests
+# ユニットテスト + プロパティベーステスト
 cargo test
 ```
-
----
-
-## 🚀 Kiro University Challenge Implementation Matrix
-
-| Lesson | Focus Area | Implementation Path |
-| :--- | :--- | :--- |
-| **Lesson 1** | Spec-driven dev (EARS) | `.kiro/specs/trace-parser-spec.md` |
-| **Lesson 2** | Steering documents | `.kiro/steering/architecture.md` |
-| **Lesson 3** | Automation Hooks | `.kiro/hooks/hooks.json` |
-| **Lesson 4** | Property-Based Testing | `src/parser.rs` (tested with `proptest`) |
-| **Lesson 5** | Powers | `.kiro/powers/profile-analyzer.json` |
-| **Lesson 6** | MCP Configuration | `.kiro/mcp.json` |
-| **Lesson 7** | Custom Agents | `.kiro/agents/profile-optimizer.json` |
