@@ -10,7 +10,7 @@ mod parser;
 mod path_checker;
 
 use parser::{analyze_trace, ProfileKind};
-use path_checker::{run_path_health, DeadReason};
+use path_checker::{compute_health_score, run_path_health_from, DeadReason};
 
 #[derive(Parser)]
 #[command(
@@ -42,7 +42,16 @@ enum Commands {
         spawn: Option<String>,
     },
     /// PATH 環境変数の健全性を診断する（Dead Path・重複エントリの検出）
-    PathHealth,
+    PathHealth {
+        /// 診断する PATH 文字列を直接指定する（省略時は環境変数 PATH を使用）
+        /// 例: --path "/usr/bin:/usr/local/bin:/nonexistent"
+        #[arg(long, value_name = "PATH_STRING")]
+        path: Option<String>,
+
+        /// 問題が 1 件以上検出されたとき非ゼロ終了コードで終了する（CI 向け）
+        #[arg(long)]
+        fail_on_issues: bool,
+    },
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -50,7 +59,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     match cli.command {
         Commands::Demo { file, spawn } => run_demo(file, spawn)?,
-        Commands::PathHealth => run_path_health_cmd(),
+        Commands::PathHealth {
+            path,
+            fail_on_issues,
+        } => run_path_health_cmd(path.as_deref(), fail_on_issues)?,
     }
 
     Ok(())
@@ -59,7 +71,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 // ─── Demo コマンド ────────────────────────────────────────────
 
 fn run_demo(file: Option<String>, spawn: Option<String>) -> Result<(), Box<dyn std::error::Error>> {
-    // モード選択: --spawn > --file > サンプルデータ
     if let Some(profile_path) = spawn {
         run_demo_spawn(&profile_path)
     } else if let Some(trace_path) = file {
@@ -69,10 +80,8 @@ fn run_demo(file: Option<String>, spawn: Option<String>) -> Result<(), Box<dyn s
     }
 }
 
-/// --spawn: headless シェルを起動してリアルタイムにトレースを取得する
 fn run_demo_spawn(profile_path: &str) -> Result<(), Box<dyn std::error::Error>> {
     let kind = ProfileKind::from_path(profile_path);
-
     println!(
         "{}",
         format!(
@@ -85,7 +94,6 @@ fn run_demo_spawn(profile_path: &str) -> Result<(), Box<dyn std::error::Error>> 
     );
 
     let trace_output = spawn_shell_trace(profile_path, &kind)?;
-
     if trace_output.trim().is_empty() {
         eprintln!(
             "{}",
@@ -93,74 +101,53 @@ fn run_demo_spawn(profile_path: &str) -> Result<(), Box<dyn std::error::Error>> 
         );
         return Ok(());
     }
-
     print_trace_results(&trace_output, kind.suffix(), kind.display_name());
     Ok(())
 }
 
-/// 指定プロファイルを headless シェルで実行し、PS4 タイムスタンプ付きトレースを返す
 fn spawn_shell_trace(
     profile_path: &str,
     kind: &ProfileKind,
 ) -> Result<String, Box<dyn std::error::Error>> {
     let output = match kind {
-        ProfileKind::Zsh => {
-            // zsh: XTRACE + PS4 の高精度タイムスタンプ形式でプロファイルをソース
-            Command::new("zsh")
-                .args([
-                    "-c",
-                    &format!(
-                        "PS4='+${{EPOCHREALTIME}} ${{(%):-%x}}:${{LINENO}}: ' zsh --no-rcs -o xtrace -i -c 'source {profile_path}' 2>&1"
-                    ),
-                ])
-                .output()
-        }
-        ProfileKind::Bash => {
-            // bash: PS4 フォーマット + xtrace でプロファイルをソース
-            Command::new("bash")
-                .args([
-                    "-c",
-                    &format!(
-                        "PS4='+$(date +%s.%N) ${{BASH_SOURCE}}:${{LINENO}}: ' bash --norc -x -c 'source {profile_path}' 2>&1"
-                    ),
-                ])
-                .output()
-        }
-        ProfileKind::PowerShell => {
-            // PowerShell: Set-PSDebug -Trace でスクリプトをトレース
-            Command::new("pwsh")
-                .args([
-                    "-NoProfile",
-                    "-Command",
-                    &format!(
-                        "Set-PSDebug -Trace 2; . '{profile_path}'; Set-PSDebug -Off"
-                    ),
-                ])
-                .output()
-        }
-        ProfileKind::Other(_) => {
-            // 拡張子不明: sh として試みる
-            Command::new("sh")
-                .args([
-                    "-c",
-                    &format!(
-                        "PS4='+$(date +%s.%6N) ${{0}}:${{LINENO}}: ' sh -x '{profile_path}' 2>&1"
-                    ),
-                ])
-                .output()
-        }
+        ProfileKind::Zsh => Command::new("zsh")
+            .args([
+                "-c",
+                &format!(
+                    "PS4='+${{EPOCHREALTIME}} ${{(%):-%x}}:${{LINENO}}: ' zsh --no-rcs -o xtrace -i -c 'source {profile_path}' 2>&1"
+                ),
+            ])
+            .output(),
+        ProfileKind::Bash => Command::new("bash")
+            .args([
+                "-c",
+                &format!(
+                    "PS4='+$(date +%s.%N) ${{BASH_SOURCE}}:${{LINENO}}: ' bash --norc -x -c 'source {profile_path}' 2>&1"
+                ),
+            ])
+            .output(),
+        ProfileKind::PowerShell => Command::new("pwsh")
+            .args([
+                "-NoProfile",
+                "-Command",
+                &format!("Set-PSDebug -Trace 2; . '{profile_path}'; Set-PSDebug -Off"),
+            ])
+            .output(),
+        ProfileKind::Other(_) => Command::new("sh")
+            .args([
+                "-c",
+                &format!(
+                    "PS4='+$(date +%s.%6N) ${{0}}:${{LINENO}}: ' sh -x '{profile_path}' 2>&1"
+                ),
+            ])
+            .output(),
     };
 
     match output {
         Ok(out) => {
             if !out.status.success() && out.stdout.is_empty() && out.stderr.is_empty() {
-                return Err(format!(
-                    "Shell process exited with status: {}",
-                    out.status
-                )
-                .into());
+                return Err(format!("Shell process exited with status: {}", out.status).into());
             }
-            // stdout + stderr を結合（トレースは stderr に出ることが多い）
             let mut combined = String::from_utf8_lossy(&out.stdout).to_string();
             combined.push_str(&String::from_utf8_lossy(&out.stderr));
             Ok(combined)
@@ -169,10 +156,8 @@ fn spawn_shell_trace(
     }
 }
 
-/// --file: トレースログファイルを読み込んで解析する
 fn run_demo_from_file(trace_path: &str) -> Result<(), Box<dyn std::error::Error>> {
     let kind = ProfileKind::from_path(trace_path);
-
     println!(
         "{}",
         format!("🩺 Analyzing trace file: {}", trace_path).cyan().bold()
@@ -186,9 +171,6 @@ fn run_demo_from_file(trace_path: &str) -> Result<(), Box<dyn std::error::Error>
         return Ok(());
     }
 
-    // ファイル名からサフィックスを推定。--file はトレースログなので
-    // ファイル名そのものではなくログ内のパスが基準。
-    // フォールバックとして Path から末尾のファイル名コンポーネントを使う。
     let suffix = Path::new(trace_path)
         .file_name()
         .and_then(|n| n.to_str())
@@ -198,7 +180,6 @@ fn run_demo_from_file(trace_path: &str) -> Result<(), Box<dyn std::error::Error>
     Ok(())
 }
 
-/// サンプルデータ（引数なし実行時のデモ）
 fn run_demo_sample() -> Result<(), Box<dyn std::error::Error>> {
     println!(
         "{}",
@@ -216,7 +197,6 @@ fn run_demo_sample() -> Result<(), Box<dyn std::error::Error>> {
     );
     println!();
 
-    // Zsh / Bash / PowerShell のサンプルをまとめて表示
     for kind in [ProfileKind::Zsh, ProfileKind::Bash, ProfileKind::PowerShell] {
         println!(
             "{}",
@@ -226,7 +206,6 @@ fn run_demo_sample() -> Result<(), Box<dyn std::error::Error>> {
         );
         print_trace_results(kind.sample_trace(), kind.suffix(), kind.display_name());
     }
-
     Ok(())
 }
 
@@ -237,10 +216,8 @@ fn print_trace_results(trace_output: &str, suffix: &str, shell_name: &str) {
     if profiles.is_empty() {
         println!(
             "{}",
-            format!(
-                "  ✅ No bottlenecks detected in {shell_name} profile (all commands < 1ms)."
-            )
-            .green()
+            format!("  ✅ No bottlenecks detected in {shell_name} profile (all commands < 1ms).")
+                .green()
         );
         println!();
         return;
@@ -281,45 +258,32 @@ fn print_trace_results(trace_output: &str, suffix: &str, shell_name: &str) {
 
 // ─── PathHealth コマンド ──────────────────────────────────────
 
-fn run_path_health_cmd() {
-    println!(
-        "{}",
-        "🩺 Diagnosing PATH environment variable...".cyan().bold()
-    );
+fn run_path_health_cmd(
+    custom_path: Option<&str>,
+    fail_on_issues: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // --path 指定の有無をユーザーに明示
+    if let Some(p) = custom_path {
+        println!(
+            "{}",
+            format!("🩺 Diagnosing custom PATH string: {}", p).cyan().bold()
+        );
+    } else {
+        println!(
+            "{}",
+            "🩺 Diagnosing PATH environment variable...".cyan().bold()
+        );
+    }
     println!();
 
-    let report = run_path_health();
+    let report = run_path_health_from(custom_path);
 
     // ── Dead Paths テーブル ──────────────────────────────────
     println!("{}", "Dead Paths".red().bold());
     if report.dead_paths.is_empty() {
         println!("{}\n", "  ✅ No dead paths found.".green());
     } else {
-        let mut table = Table::new();
-        table
-            .load_preset(UTF8_FULL)
-            .apply_modifier(UTF8_ROUND_CORNERS)
-            .set_content_arrangement(ContentArrangement::Dynamic)
-            .set_header(vec![
-                Cell::new("#").add_attribute(Attribute::Bold),
-                Cell::new("Path").add_attribute(Attribute::Bold),
-                Cell::new("Reason").add_attribute(Attribute::Bold),
-            ]);
-
-        for dead in &report.dead_paths {
-            let (reason_str, color) = match dead.reason {
-                DeadReason::NotFound => ("Not Found", Color::Red),
-                DeadReason::NotADirectory => ("Not a Directory", Color::Red),
-                DeadReason::PermissionDenied => ("Permission Denied", Color::Magenta),
-            };
-            table.add_row(Row::from(vec![
-                Cell::new(dead.index + 1),
-                Cell::new(&dead.raw).fg(color),
-                Cell::new(reason_str).fg(color),
-            ]));
-        }
-
-        println!("{table}\n");
+        println!("{}\n", build_dead_paths_table(&report.dead_paths));
     }
 
     // ── Duplicate Paths テーブル ─────────────────────────────
@@ -327,50 +291,11 @@ fn run_path_health_cmd() {
     if report.duplicates.is_empty() {
         println!("{}\n", "  ✅ No duplicates found.".green());
     } else {
-        let mut table = Table::new();
-        table
-            .load_preset(UTF8_FULL)
-            .apply_modifier(UTF8_ROUND_CORNERS)
-            .set_content_arrangement(ContentArrangement::Dynamic)
-            .set_header(vec![
-                Cell::new("#").add_attribute(Attribute::Bold),
-                Cell::new("Path").add_attribute(Attribute::Bold),
-                Cell::new("Status").add_attribute(Attribute::Bold),
-                Cell::new("Count").add_attribute(Attribute::Bold),
-            ]);
-
-        for dup in &report.duplicates {
-            for (i, &occ_idx) in dup.occurrences.iter().enumerate() {
-                let is_first = i == 0;
-                let status = if is_first { "first" } else { "duplicate" };
-                let color = if is_first { Color::Green } else { Color::Yellow };
-                let count_cell = if is_first {
-                    Cell::new(dup.occurrences.len()).fg(color)
-                } else {
-                    Cell::new("—").fg(color)
-                };
-
-                table.add_row(Row::from(vec![
-                    Cell::new(occ_idx + 1).fg(color),
-                    Cell::new(&dup.canonical).fg(color),
-                    Cell::new(status).fg(color),
-                    count_cell,
-                ]));
-            }
-        }
-
-        println!("{table}\n");
+        println!("{}\n", build_duplicates_table(&report.duplicates));
     }
 
     // ── Health Score ─────────────────────────────────────────
-    let issue_count = report.dead_paths.len() + report.duplicates.len();
-    let score = if report.total == 0 {
-        100u32
-    } else {
-        let penalty = (issue_count * 100) / report.total;
-        100u32.saturating_sub(penalty as u32)
-    };
-
+    let score = compute_health_score(&report);
     let score_colored = match score {
         90..=100 => score.to_string().green().bold(),
         60..=89 => score.to_string().yellow().bold(),
@@ -379,7 +304,7 @@ fn run_path_health_cmd() {
 
     // ── サマリー行（仕様書 §3-3）─────────────────────────────
     println!(
-        "⚡ {} {} entries | {} dead | {} duplicates | {} skipped",
+        "⚡ {} {} entries | {} dead | {} duplicates | Skipped (invalid): {} entries",
         "PATH Health Summary:".bold(),
         report.total.to_string().cyan(),
         report.dead_paths.len().to_string().red(),
@@ -387,4 +312,74 @@ fn run_path_health_cmd() {
         report.skipped_count.to_string().white(),
     );
     println!("🏥 Health Score: {}/100", score_colored);
+
+    // --fail-on-issues: 問題が1件でもあれば非ゼロで終了
+    if fail_on_issues && (!report.dead_paths.is_empty() || !report.duplicates.is_empty()) {
+        std::process::exit(1);
+    }
+
+    Ok(())
+}
+
+/// Dead Paths テーブルを構築して返す
+fn build_dead_paths_table(dead_paths: &[path_checker::DeadPathEntry]) -> Table {
+    let mut table = Table::new();
+    table
+        .load_preset(UTF8_FULL)
+        .apply_modifier(UTF8_ROUND_CORNERS)
+        .set_content_arrangement(ContentArrangement::Dynamic)
+        .set_header(vec![
+            Cell::new("#").add_attribute(Attribute::Bold),
+            Cell::new("Path").add_attribute(Attribute::Bold),
+            Cell::new("Reason").add_attribute(Attribute::Bold),
+        ]);
+
+    for dead in dead_paths {
+        let (reason_str, color) = match dead.reason {
+            DeadReason::NotFound => ("Not Found", Color::Red),
+            DeadReason::NotADirectory => ("Not a Directory", Color::Red),
+            DeadReason::PermissionDenied => ("Permission Denied", Color::Magenta),
+        };
+        table.add_row(Row::from(vec![
+            Cell::new(dead.index + 1),
+            Cell::new(&dead.raw).fg(color),
+            Cell::new(reason_str).fg(color),
+        ]));
+    }
+    table
+}
+
+/// Duplicate Paths テーブルを構築して返す
+fn build_duplicates_table(duplicates: &[path_checker::DuplicateEntry]) -> Table {
+    let mut table = Table::new();
+    table
+        .load_preset(UTF8_FULL)
+        .apply_modifier(UTF8_ROUND_CORNERS)
+        .set_content_arrangement(ContentArrangement::Dynamic)
+        .set_header(vec![
+            Cell::new("#").add_attribute(Attribute::Bold),
+            Cell::new("Path").add_attribute(Attribute::Bold),
+            Cell::new("Status").add_attribute(Attribute::Bold),
+            Cell::new("Count").add_attribute(Attribute::Bold),
+        ]);
+
+    for dup in duplicates {
+        for (i, &occ_idx) in dup.occurrences.iter().enumerate() {
+            let is_first = i == 0;
+            let status = if is_first { "first" } else { "duplicate" };
+            let color = if is_first { Color::Green } else { Color::Yellow };
+            let count_cell = if is_first {
+                Cell::new(dup.occurrences.len()).fg(color)
+            } else {
+                Cell::new("—").fg(color)
+            };
+            table.add_row(Row::from(vec![
+                Cell::new(occ_idx + 1).fg(color),
+                Cell::new(&dup.canonical).fg(color),
+                Cell::new(status).fg(color),
+                count_cell,
+            ]));
+        }
+    }
+    table
 }
